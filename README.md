@@ -17,6 +17,16 @@ Skyris Technic 6S (PX4 + Orange Pi 5 Pro, ROS 1/rospy). Подробности �
   кубе → ожидание → возврат).
 - `bvs2_flight.py` — полётный сценарий БВС-2 (взлёт → зона захвата груза →
   захват → своя зарядная станция на кубе → зарядка + сброс груза → возврат).
+- `station_protocol.py` — протокол БВС↔станция: запрос посадки/разрешение на
+  посадку через цвет ленты, «зарядка завершена» для БВС-1 через команду с
+  клавиатуры.
+- `mission_sync.py` — синхронный взлёт двух БВС (`TakeoffBarrier` поверх TCP)
+  и запуск задач параллельно, с ожиданием по событию/таймауту вместо
+  жёсткого `sleep` (`run_concurrently`).
+
+`station_protocol.py` и `mission_sync.py` — самостоятельные модули
+Приоритета 4 (см. `PLAN.md`); в `bvs1_flight.py`/`bvs2_flight.py` они пока
+не подключены — это интеграция Приоритета 5.
 
 ## Запуск БВС-1 на дроне
 
@@ -90,6 +100,30 @@ python3 bvs2_flight.py \
 и `--gripper-open-pulse`/`--gripper-close-pulse` нужно подобрать под
 конкретный сервопривод/захват на площадке (см. `gripper_control.py`).
 
+## Связь и синхронизация (Приоритет 4)
+
+`station_protocol.py` и `mission_sync.py` можно опробовать в поле отдельно
+от полётных скриптов — до того, как их подключат к `bvs1_flight.py`/
+`bvs2_flight.py`.
+
+Координатор синхронного взлёта (`TakeoffBarrier`) — запускается один раз,
+обычно на ноутбуке оператора, видимом по сети (роутер) обоим Orange Pi:
+
+```bash
+# на ноутбуке оператора
+python3 mission_sync.py --serve --port 5757 --parties 2
+
+# на каждом БВС (Orange Pi)
+python3 mission_sync.py --wait --host <ip-ноутбука> --port 5757
+```
+
+Ожидание команды с клавиатуры на взлёт БВС-1 после зарядки (алгоритм
+TASK.md, шаг 5):
+
+```bash
+python3 station_protocol.py --wait-takeoff-command
+```
+
 ## Проверка без дрона (self-test)
 
 Логика сценариев (без rospy/реального полёта) проверяется так:
@@ -100,6 +134,8 @@ python3 bvs2_flight.py --self-test
 python3 flight_core.py
 python3 led_interface.py --self-test
 python3 energy_relay_vision.py --self-test
+python3 station_protocol.py --self-test
+python3 mission_sync.py --self-test
 ```
 
 Это не заменяет реальный полёт — только проверяет, что код не сломан
@@ -121,5 +157,10 @@ python3 energy_relay_vision.py --self-test
   `--pickup-altitude` и задержка захвата — подобрать под конкретный
   сервопривод/магнит и груз.
 
+Для координатора синхронного взлёта (`mission_sync.py --serve`) — адрес и
+порт ноутбука оператора должны быть реально доступны обоим Orange Pi по
+сети (роутер из комплекта); проверить на площадке в первый день вместе с
+остальными допущениями.
+
 Подробнее — в `TASK.md` (раздел «Уже реализовано») и `PLAN.md` (пункты 3.1,
-3.2).
+3.2, 4.1, 4.2).
