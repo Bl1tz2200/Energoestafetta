@@ -9,7 +9,8 @@ Skyris Technic 6S (PX4 + Orange Pi 5 Pro, ROS 1/rospy). Подробности �
 - `field_map.txt` — карта поля (49 ArUco-меток 7×7, шаг 1 м) в формате
   `aruco_pose`/`aruco_map`, нужна для навигации `frame_id='aruco_map'`.
 - `flight_core.py` — общие примитивы полёта (взлёт/полёт/посадка,
-  чтение карты, посадка на приподнятую поверхность по дальномеру).
+  чтение карты, посадка на приподнятую поверхность по дальномеру,
+  имитация зарядки `simulate_charging`).
 - `led_interface.py` — управление светодиодной лентой (`set_led`).
 - `gripper_control.py` — управление захватом груза через `gpio` (Orange Pi).
 - `energy_relay_vision.py` — распознавание ArUco-меток и цвета станции.
@@ -23,6 +24,9 @@ Skyris Technic 6S (PX4 + Orange Pi 5 Pro, ROS 1/rospy). Подробности �
 - `mission_sync.py` — синхронный взлёт двух БВС (`TakeoffBarrier` поверх TCP)
   и запуск задач параллельно, с ожиданием по событию/таймауту вместо
   жёсткого `sleep` (`run_concurrently`).
+- `flight_test_support.py` — общие заглушки (`FakeFlight`, `FakeClock`,
+  запись LED-команд) для `--self-test` в `bvs1_flight.py`/`bvs2_flight.py`;
+  на дрон переносить не обязательно, боевого кода не содержит.
 
 `station_protocol.py` и `mission_sync.py` — самостоятельные модули
 Приоритета 4 (см. `PLAN.md`); в `bvs1_flight.py`/`bvs2_flight.py` они пока
@@ -144,6 +148,7 @@ python3 bvs1_flight.py --self-test
 python3 bvs2_flight.py --self-test
 python3 flight_core.py
 python3 led_interface.py --self-test
+python3 gripper_control.py --self-test
 python3 energy_relay_vision.py --self-test
 python3 station_protocol.py --self-test
 python3 mission_sync.py --self-test
@@ -151,7 +156,81 @@ python3 mission_sync.py --self-test
 
 Это не заменяет реальный полёт — только проверяет, что код не сломан
 синтаксически/логически (правильный порядок вызовов, LED-паттерны, расчёт
-координат по карте и т.д.).
+координат по карте и т.д.). `energy_relay_vision.py` дополнительно требует
+`opencv-contrib-python`/`numpy` (см. следующий раздел) — без них скрипт сразу
+завершится понятной ошибкой, а не упадёт глубоко внутри кода.
+
+## Перенос кода на дрон
+
+Разработка идёт на ноутбуке без ROS 1 — самотесты выше это и проверяют. Но
+перед выходом на площадку (или перед каждой тестовой/зачётной попыткой, если
+код правился между ними) код нужно перенести на Orange Pi **обоих** БВС и
+прогнать самотесты уже там, на актуальном для полёта окружении:
+
+1. **Скопировать файлы на Orange Pi.** Любой вариант, которым уже пользуется
+   команда, подходит — репозиторий не привязан к конкретному способу:
+
+   ```bash
+   # вариант А — git (если на Orange Pi есть доступ к тому же репозиторию)
+   ssh orangepi@<ip-бвс> 'cd ~/energoestafetta && git pull'
+
+   # вариант Б — rsync с ноутбука, без старого __pycache__/незакоммиченного мусора
+   rsync -avz --exclude '__pycache__' --exclude '*.pyc' \
+       ./ orangepi@<ip-бвс>:~/energoestafetta/
+   ```
+
+   Оба БВС и станция (если на ней тоже Python-код) — **отдельные** Orange
+   Pi/Raspberry Pi, копировать нужно на каждый по отдельности.
+
+2. **Прогнать самотесты на самом Orange Pi**, а не только на ноутбуке —
+   версия Python и установленные пакеты на борту могут отличаться:
+
+   ```bash
+   ssh orangepi@<ip-бвс>
+   cd ~/energoestafetta
+   python3 bvs1_flight.py --self-test   # и остальные модули, см. выше
+   ```
+
+   Если не проходит — почти всегда это версия Python (регламент требует
+   3.8) или отсутствующий пакет, а не полётная логика (она уже проверена на
+   ноутбуке); `energy_relay_vision.py --self-test` первым укажет на
+   отсутствие `opencv-contrib-python`/`numpy` понятным сообщением.
+
+3. **Обновить карту поля на платформе**, если раскладка `field_map.txt`
+   изменилась — это отдельный файл от `aruco_pose`, платформенная нода
+   берёт свою копию, см. «Запуск БВС-1 на дроне», п. 2 выше:
+
+   ```bash
+   cp ~/energoestafetta/field_map.txt ~/technic_ws/src/technic/aruco_pose/map/map1.txt
+   rosnode kill /aruco_map
+   ```
+
+4. **Проверить окружение ROS 1** уже на Orange Pi перед реальным запуском
+   (самотесты его не используют и не заменяют):
+
+   ```bash
+   source /opt/ros/noetic/setup.bash
+   source ~/technic_ws/devel/setup.bash
+   ```
+
+5. **Права на исполнение** — большинство скриптов уже отмечены
+   исполняемыми (`chmod +x`), но при запуске всегда через `python3 script.py
+   ...` (как в этом README) это не обязательно; проверить/восстановить,
+   если нужен прямой запуск `./bvs1_flight.py`:
+
+   ```bash
+   chmod +x bvs1_flight.py bvs2_flight.py flight_core.py led_interface.py \
+       gripper_control.py station_protocol.py mission_sync.py
+   ```
+
+6. **Если правки делаются прямо в поле** (на Orange Pi, без ноутбука) —
+   не забыть скопировать их обратно (`git add`/`commit`/`push` или обратный
+   `rsync`), иначе они потеряются при переустановке образа/следующей
+   синхронизации с ноутбука.
+
+Итоговый порядок перед каждой попыткой: самотесты на ноутбуке → перенос на
+оба Orange Pi → самотесты там же → проверка карты поля/окружения ROS →
+реальный запуск по инструкциям ниже.
 
 ## Что проверить на площадке в первый день
 

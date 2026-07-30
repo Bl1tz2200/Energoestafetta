@@ -20,10 +20,17 @@
 (аналог ширины импульса сервопривода), их нужно подобрать под конкретный
 захват по факту на площадке. Для другого механизма по-прежнему можно
 использовать ``configure_gripper()``.
+
+Проверка модуля без реального Orange Pi/``gpio`` (у ``TechnicGPIOBackend``
+есть аргумент ``runner``, который подставляется заглушкой вместо реального
+процесса ``gpio``)::
+
+    python3 gripper_control.py --self-test
 """
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable
 from enum import Enum
 from threading import Lock
@@ -241,3 +248,112 @@ def shutdown_gripper() -> None:
         action()
 
 
+def _self_test() -> int:
+    # Гарантируем чистое состояние независимо от порядка запуска тестов.
+    shutdown_gripper()
+
+    # Захват не настроен -> gripper_open()/gripper_close() кидают RuntimeError
+    try:
+        gripper_open()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Ожидался RuntimeError для ненастроенного захвата")
+
+    calls: list = []
+
+    def fake_runner(*args: Any) -> None:
+        calls.append(args)
+
+    # startup_delay=0, чтобы самотест не спал реально
+    backend = TechnicGPIOBackend(
+        17, open_pulse=1000, close_pulse=2000, startup_delay=0, runner=fake_runner
+    )
+    assert calls == [("mode", 17, "pwm"), ("pwmr", 17, 20000), ("pwmc", 17, 24)]
+
+    configure_gripper(
+        open_action=backend.open,
+        close_action=backend.close,
+        shutdown_action=backend.shutdown,
+    )
+    assert get_gripper_state() == GripperState.UNKNOWN
+
+    gripper_close()
+    assert calls[-1] == ("pwm", 17, 2000)
+    assert get_gripper_state() == GripperState.CLOSED
+
+    calls_before_repeat = len(calls)
+    gripper_close()  # повторная команда в том же состоянии — no-op
+    assert len(calls) == calls_before_repeat
+
+    gripper_open()
+    assert calls[-1] == ("pwm", 17, 1000)
+    assert get_gripper_state() == GripperState.OPEN
+
+    shutdown_gripper()
+    assert calls[-1] == ("pwm", 17, 0)
+    assert get_gripper_state() == GripperState.UNKNOWN
+
+    # После shutdown backend больше не принимает команды
+    try:
+        backend.open()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Ожидался RuntimeError после shutdown()")
+
+    # Валидация параметров конструктора
+    invalid_kwargs = (
+        {"pin": -1, "open_pulse": 1000, "close_pulse": 2000},
+        {"pin": 17, "open_pulse": 0, "close_pulse": 2000},
+        {"pin": 17, "open_pulse": 1000, "close_pulse": 2000, "pwm_range": 0},
+    )
+    for kwargs in invalid_kwargs:
+        try:
+            TechnicGPIOBackend(startup_delay=0, runner=fake_runner, **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Ожидался ValueError для {!r}".format(kwargs))
+
+    try:
+        configure_gripper(open_action="not callable", close_action=backend.close)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("Ожидался TypeError для нефункционального open_action")
+
+    try:
+        gripper_open(delay=-1.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Ожидался ValueError для отрицательного delay")
+
+    shutdown_gripper()
+    print("SELF-TEST: OK")
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Управление захватом груза (Энергоэстафета)"
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="проверить логику захвата без реального Orange Pi/gpio",
+    )
+    return parser
+
+
+def main() -> int:
+    args = _build_parser().parse_args()
+    if args.self_test:
+        return _self_test()
+    _build_parser().print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

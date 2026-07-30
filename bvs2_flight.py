@@ -238,13 +238,13 @@ def run_mission(
 
     # 7. Имитация зарядки: заглушка вместо честных 15с/5с (Табл.1) — общая
     # длительность конфигурируется, соотношение «зелёный за N секунд до
-    # взлёта» сохранено (см. bvs1_flight.py).
-    led.set_led("blink", "red")
-    hold_s = config.charge_wait_total_s - config.charge_green_before_takeoff_s
-    if hold_s > 0:
-        sleep_fn(hold_s)
-    led.set_led("blink", "green")
-    sleep_fn(config.charge_green_before_takeoff_s)
+    # взлёта» сохранено (см. bvs1_flight.py/flight_core.simulate_charging).
+    fc.simulate_charging(
+        led.set_led,
+        total_s=config.charge_wait_total_s,
+        green_before_takeoff_s=config.charge_green_before_takeoff_s,
+        sleep_fn=sleep_fn,
+    )
 
     # 8. Сброс груза — после имитации зарядки, перед повторным взлётом
     # (порядок из текста шага 6 алгоритма).
@@ -292,50 +292,15 @@ def run_mission(
 
 
 def _self_test() -> int:
-    recorded_leds = []
+    import flight_test_support as fts
 
-    def effect_writer(effect: str, color: Tuple[int, int, int]) -> None:
-        recorded_leds.append((effect, color))
-
-    def pixels_writer(colors) -> None:
-        recorded_leds.append(("pixels", tuple(colors)))
-
-    led.configure_backend(led.CallbackBackend(12, effect_writer, pixels_writer))
+    recorded_leds, _led_backend = fts.record_led_calls()
 
     markers = {0: (3.0, 0.0, 0.0), 5: (5.0, 0.0, 0.0), 20: (6.0, 2.0, 0.0)}
 
-    class FakeTelemetry:
-        def __init__(self, x: float, y: float, z: float, armed: bool) -> None:
-            self.x, self.y, self.z, self.armed = x, y, z, armed
-
-    state = {"x": 6.0, "y": 2.0, "z": 0.0, "armed": False}
-    navigate_calls = []
-
-    def fake_navigate(*, x: float, y: float, z: float, speed: float, frame_id: str, auto_arm: bool = False) -> None:
-        navigate_calls.append(
-            {"x": x, "y": y, "z": z, "frame_id": frame_id, "auto_arm": auto_arm}
-        )
-        state["x"], state["y"], state["z"] = x, y, z
-        state["armed"] = True
-
-    def fake_get_telemetry(**_kwargs: object) -> FakeTelemetry:
-        return FakeTelemetry(state["x"], state["y"], state["z"], state["armed"])
-
-    def fake_land() -> None:
-        state["armed"] = False
-
-    disarm_calls = []
-
-    def fake_arming(value: bool) -> None:
-        disarm_calls.append(value)
-        state["armed"] = value
-
-    proxies = fc.FlightProxies(
-        get_telemetry=fake_get_telemetry,
-        navigate=fake_navigate,
-        land=fake_land,
-        arming=fake_arming,
-    )
+    flight = fts.FakeFlight(start_x=6.0, start_y=2.0)
+    navigate_calls = flight.navigate_calls
+    disarm_calls = flight.disarm_calls
 
     gripper_calls = []
     gripper_proxy = GripperProxy(
@@ -343,16 +308,7 @@ def _self_test() -> int:
         close=lambda: gripper_calls.append("close"),
     )
 
-    def fake_rangefinder(_timeout: float) -> float:
-        return 0.05  # мгновенное «касание» для быстрого теста
-
-    clock = [0.0]
-
-    def fake_sleep(duration: float) -> None:
-        clock[0] += duration
-
-    def fake_time() -> float:
-        return clock[0]
+    clock = fts.FakeClock()
 
     config = MissionConfig(
         start_marker_id=20,
@@ -369,13 +325,13 @@ def _self_test() -> int:
     )
 
     run_mission(
-        proxies,
+        flight.proxies,
         gripper_proxy,
         markers,
         config,
-        rangefinder_reader=fake_rangefinder,
-        sleep_fn=fake_sleep,
-        time_fn=fake_time,
+        rangefinder_reader=fts.instant_touchdown_rangefinder,
+        sleep_fn=clock.sleep,
+        time_fn=clock.time,
     )
 
     # Взлёт со старта
@@ -413,7 +369,7 @@ def _self_test() -> int:
     assert navigate_calls[-2]["auto_arm"] is True
     assert navigate_calls[-1]["x"] == 6.0 and navigate_calls[-1]["y"] == 2.0
 
-    assert state["armed"] is False  # завершили штатным land_wait
+    assert flight.state["armed"] is False  # завершили штатным land_wait
 
     patterns = [entry for entry in recorded_leds if entry[0] in ("fill", "blink", "rainbow")]
     assert patterns[0] == ("blink", (255, 255, 0))  # взлёт / полёт к грузу

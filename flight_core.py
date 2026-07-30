@@ -315,6 +315,35 @@ def controlled_descent_and_disarm(
     )
 
 
+def simulate_charging(
+    set_led_fn: Callable[[str, Any], None],
+    *,
+    total_s: float,
+    green_before_takeoff_s: float,
+    sleep_fn: Callable[[float], None] = sleep,
+) -> None:
+    """Имитация зарядки по Табл.1: красная мигающая лента, а за
+    ``green_before_takeoff_s`` секунд до взлёта — зелёная мигающая.
+
+    Общая для ``bvs1_flight.py`` и ``bvs2_flight.py`` (шаг «имитация
+    зарядки» в обоих сценариях делает ровно это), поэтому вынесена сюда, а
+    не продублирована в каждом скрипте. ``set_led_fn`` принимается явным
+    аргументом (обычно ``led_interface.set_led``), а не импортируется
+    напрямую — ``flight_core`` не должен знать про LED-модуль.
+    """
+    if total_s < 0:
+        raise ValueError("total_s не может быть отрицательным")
+    if green_before_takeoff_s < 0:
+        raise ValueError("green_before_takeoff_s не может быть отрицательным")
+
+    set_led_fn("blink", "red")
+    hold_s = total_s - green_before_takeoff_s
+    if hold_s > 0:
+        sleep_fn(hold_s)
+    set_led_fn("blink", "green")
+    sleep_fn(green_before_takeoff_s)
+
+
 def _self_test() -> int:
     import tempfile
     import os
@@ -502,6 +531,39 @@ def _self_test() -> int:
     assert descent_safety.touchdown_detected is False
     assert descent_safety.final_z == 0.85
     assert disarm_calls == [False]
+
+    # simulate_charging: красный на всё время, кроме последних N секунд —
+    # зелёный; суммарное время сна равно total_s
+    led_calls = []
+
+    def fake_set_led(pattern: str, color: object) -> None:
+        led_calls.append((pattern, color))
+
+    sleep_calls = []
+
+    def recording_sleep(duration: float) -> None:
+        sleep_calls.append(duration)
+
+    simulate_charging(
+        fake_set_led,
+        total_s=15.0,
+        green_before_takeoff_s=5.0,
+        sleep_fn=recording_sleep,
+    )
+    assert led_calls == [("blink", "red"), ("blink", "green")]
+    assert sleep_calls == [10.0, 5.0]
+
+    # simulate_charging: green_before_takeoff_s >= total_s -> без красной фазы
+    led_calls.clear()
+    sleep_calls.clear()
+    simulate_charging(
+        fake_set_led,
+        total_s=5.0,
+        green_before_takeoff_s=5.0,
+        sleep_fn=recording_sleep,
+    )
+    assert led_calls == [("blink", "red"), ("blink", "green")]
+    assert sleep_calls == [5.0]  # красная фаза пропущена (hold_s <= 0)
 
     print("SELF-TEST: OK")
     return 0
