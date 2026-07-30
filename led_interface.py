@@ -20,10 +20,14 @@
 * ``half-half`` — первая и вторая половины ленты имеют разные цвета.
 
 По умолчанию установлен безопасный ConsoleBackend: команды проверяются и
-печатаются, но физическая лента не меняется. Для ROS 2 на платформе Sverk
-передайте уже созданный объект drone в ``use_sverk_ros2_backend(drone)``.
-Для автономной проверки ленты backend может создать ROS-узел сам:
-``use_sverk_ros2_backend()``. Для другого API используйте ``CallbackBackend``.
+печатаются, но физическая лента не меняется. Дрон соревнования — Skyris
+Technic 6S (PX4 + Orange Pi 5 Pro), его штатный API — это ROS 1 (rospy),
+пакеты ``technic`` и ``led_msgs`` (см. docs.skyris.ru/technic6S/LedStrip.html):
+
+    rospy.init_node('flight')  # один раз в полётном скрипте
+    use_technic_ros1_backend()
+
+Для другого API используйте ``CallbackBackend``.
 """
 
 from __future__ import annotations
@@ -155,50 +159,78 @@ class CallbackBackend:
         self._pixels_writer(tuple(colors))
 
 
-class SverkROS2Backend:
-    """Backend ROS 2 для официального Python API ``sverk_interfaces``.
+class TechnicROS1Backend:
+    """Backend ROS 1 (rospy) для штатного LED API Skyris Technic 6S.
 
-    Если ``drone`` уже создан полётным сценарием через
-    ``sverk_interfaces.init(...)``, передайте его сюда. Если ``drone=None``,
-    backend создаст собственный ROS-узел и будет отвечать за его закрытие.
+    Реальные сервисы платформы (docs.skyris.ru/technic6S/LedStrip.html):
 
-    Импорт ``sverk_interfaces`` выполняется только при создании собственного
-    узла, поэтому тесты интерфейса работают и на компьютере без ROS 2.
+    * ``led/set_effect`` (``technic.srv.SetLEDEffect``) — параметры
+      ``r, g, b`` и опциональный ``effect`` (``fill`` по умолчанию, также
+      ``fade``, ``flash``, ``blink``, ``rainbow``);
+    * ``led/set_leds`` (``led_msgs.srv.SetLEDs``) — список
+      ``led_msgs.msg.LEDState(index, r, g, b)``;
+    * ``led/state`` (``led_msgs.msg.LEDStateArray``) — текущее число диодов.
+
+    Узел ROS (``rospy.init_node(...)``) должен быть поднят полётным
+    сценарием заранее — backend его не создаёт и не закрывает.
+
+    Прокси сервисов можно передать напрямую (``set_effect_proxy``,
+    ``set_leds_proxy``, ``state_reader``) — тогда backend не импортирует
+    ``rospy``, что удобно для тестов интерфейса без установленного ROS 1.
     """
 
     def __init__(
         self,
-        drone: Optional[Any] = None,
         led_count: Optional[int] = None,
         state_timeout: float = 5.0,
-        node_name: str = "energy_relay_led",
+        set_effect_proxy: Optional[Callable[..., Any]] = None,
+        set_leds_proxy: Optional[Callable[[Sequence[Any]], Any]] = None,
+        state_reader: Optional[Callable[[float], int]] = None,
+        led_state_factory: Optional[Callable[[int, int, int, int], Any]] = None,
     ) -> None:
         if state_timeout <= 0:
             raise ValueError("state_timeout должен быть больше нуля")
         if led_count is not None and led_count < 2:
             raise ValueError("В ленте должно быть минимум два светодиода")
 
-        self._owns_drone = drone is None
-        if drone is None:
+        need_ros = (
+            set_effect_proxy is None
+            or set_leds_proxy is None
+            or (led_count is None and state_reader is None)
+        )
+        if need_ros:
             try:
-                import sverk_interfaces
+                import rospy
+                from technic.srv import SetLEDEffect
+                from led_msgs.srv import SetLEDs
+                from led_msgs.msg import LEDState, LEDStateArray
             except ImportError as exc:
                 raise RuntimeError(
-                    "sverk_interfaces недоступен. Выполните source "
-                    "/opt/ros/*/setup.bash и source ~/sverk_ws/install/setup.bash"
+                    "Нужны rospy, technic и led_msgs. Выполните source "
+                    "/opt/ros/noetic/setup.bash и source своего catkin_ws"
                 ) from exc
-            drone = sverk_interfaces.init(Nodename=node_name)
+            if set_effect_proxy is None:
+                set_effect_proxy = rospy.ServiceProxy(
+                    "led/set_effect", SetLEDEffect
+                )
+            if set_leds_proxy is None:
+                set_leds_proxy = rospy.ServiceProxy("led/set_leds", SetLEDs)
+            if led_state_factory is None:
+                led_state_factory = LEDState
+            if state_reader is None:
+                def state_reader(timeout: float) -> int:
+                    message = rospy.wait_for_message(
+                        "led/state", LEDStateArray, timeout=timeout
+                    )
+                    return len(message.leds)
 
-        self._drone = drone
-        self._led = getattr(drone, "led", None)
-        if self._led is None:
-            if self._owns_drone:
-                self.close()
-            raise RuntimeError(
-                "LED API недоступен: drone.led is None. Проверьте пакеты "
-                "led_interfaces и узел /led_control."
-            )
+        if led_state_factory is None:
+            led_state_factory = lambda index, r, g, b: (index, r, g, b)
 
+        self._set_effect_proxy = set_effect_proxy
+        self._set_leds_proxy = set_leds_proxy
+        self._state_reader = state_reader
+        self._led_state_factory = led_state_factory
         self._state_timeout = float(state_timeout)
         # Число диодов запрашивается лениво: solid/blink/rainbow не должны
         # зависеть от доступности топика состояния. Оно нужно только half-half.
@@ -207,16 +239,7 @@ class SverkROS2Backend:
     @property
     def led_count(self) -> int:
         if self._led_count is None:
-            state = self._led.get_state(timeout=self._state_timeout)
-            leds = getattr(state, "leds", None) if state is not None else None
-            if leds is None:
-                raise RuntimeError(
-                    "Не получено состояние /led_control/state за {:.1f} с. "
-                    "Передайте led_count явно или проверьте LED-узел.".format(
-                        self._state_timeout
-                    )
-                )
-            count = len(leds)
+            count = self._state_reader(self._state_timeout)
             if count < 2:
                 raise RuntimeError(
                     "Некорректное число светодиодов: {}".format(count)
@@ -225,15 +248,14 @@ class SverkROS2Backend:
         return self._led_count
 
     def set_effect(self, effect: str, color: RGB) -> None:
+        if effect == "rainbow":
+            self._set_effect_proxy(effect="rainbow")
+            return
         red, green, blue = color
-        result = self._led.set_effect(
-            effect,
-            r=red,
-            g=green,
-            b=blue,
-            timeout=self._state_timeout,
-        )
-        _ensure_sverk_success(result, "/led_control/set_effect")
+        kwargs: Dict[str, Any] = {"r": red, "g": green, "b": blue}
+        if effect != "fill":
+            kwargs["effect"] = effect
+        self._set_effect_proxy(**kwargs)
 
     def set_pixels(self, colors: Sequence[RGB]) -> None:
         count = self.led_count
@@ -244,22 +266,10 @@ class SverkROS2Backend:
                 )
             )
         states = [
-            (index, red, green, blue)
+            self._led_state_factory(index, red, green, blue)
             for index, (red, green, blue) in enumerate(colors)
         ]
-        result = self._led.set_leds(
-            states,
-            timeout=self._state_timeout,
-        )
-        _ensure_sverk_success(result, "/led_control/set_leds")
-
-    def close(self) -> None:
-        """Закрыть только тот drone/ROS-узел, который backend создал сам."""
-        if self._owns_drone and self._drone is not None:
-            close = getattr(self._drone, "close", None)
-            if callable(close):
-                close()
-            self._drone = None
+        self._set_leds_proxy(states)
 
 
 class LEDController:
@@ -343,29 +353,19 @@ def configure_backend(backend: LEDBackend) -> LEDController:
     return _controller
 
 
-def use_sverk_ros2_backend(
-    drone: Optional[Any] = None,
+def use_technic_ros1_backend(
     led_count: Optional[int] = None,
     state_timeout: float = 5.0,
-    node_name: str = "energy_relay_led",
 ) -> LEDController:
-    """Подключить физическую ленту через ROS 2 ``sverk_interfaces``.
+    """Подключить физическую ленту через штатный ROS 1 API Skyris Technic 6S.
 
-    В полётном сценарии предпочтительно передать уже созданный ``drone``:
+    Полётный скрипт должен поднять узел ROS до вызова::
 
-        drone = sverk_interfaces.init(Nodename="fly_head")
-        use_sverk_ros2_backend(drone)
-
-    Для отдельного теста ленты ``drone`` можно не передавать — тогда будет
-    создан собственный узел с именем ``node_name``.
+        rospy.init_node('flight')
+        use_technic_ros1_backend()
     """
     return configure_backend(
-        SverkROS2Backend(
-            drone=drone,
-            led_count=led_count,
-            state_timeout=state_timeout,
-            node_name=node_name,
-        )
+        TechnicROS1Backend(led_count=led_count, state_timeout=state_timeout)
     )
 
 
@@ -380,7 +380,7 @@ def turn_off() -> LEDCommand:
 
 
 def close_led_backend() -> None:
-    """Освободить собственный ROS 2 узел backend, если он был создан модулем."""
+    """Освободить ресурсы текущего backend, если он это поддерживает."""
     close = getattr(_controller.backend, "close", None)
     if callable(close):
         close()
@@ -471,15 +471,6 @@ def _parse_color(value: ColorValue) -> RGB:
     return channels[0], channels[1], channels[2]
 
 
-def _ensure_sverk_success(result: object, service_name: str) -> None:
-    # Методы возвращают ответ ROS-сервиса; в некоторых сборках wrapper может
-    # вернуть bool или None. Отсутствие success считаем успешным возвратом.
-    success = result is not False and getattr(result, "success", True)
-    if not success:
-        message = getattr(result, "message", "команда отклонена")
-        raise RuntimeError("{}: {}".format(service_name, message))
-
-
 def _summarize_halves(colors: Iterable[RGB]) -> str:
     pixels = tuple(colors)
     if not pixels:
@@ -515,54 +506,50 @@ def _self_test() -> int:
     assert turn_off() == LEDCommand("solid", ((0, 0, 0),))
     assert current_command() == LEDCommand("solid", ((0, 0, 0),))
 
-    class FakeState:
-        leds = [object()] * 10
+    # Проверяем TechnicROS1Backend с подставными rospy-прокси, без установки
+    # ROS 1: set_effect_proxy/set_leds_proxy/state_reader эмулируют реальные
+    # сервисы led/set_effect, led/set_leds и топик led/state.
+    effect_calls: list = []
+    pixel_calls: list = []
+    state_calls = [0]
 
-    class FakeLedAPI:
-        def __init__(self) -> None:
-            self.effects = []
-            self.pixel_calls = []
-            self.state_calls = 0
+    def fake_set_effect(**kwargs: object) -> None:
+        effect_calls.append(kwargs)
 
-        def set_effect(self, effect: str, **kwargs: object) -> bool:
-            self.effects.append((effect, kwargs))
-            return True
+    def fake_set_leds(states: list) -> None:
+        pixel_calls.append(states)
 
-        def set_leds(self, leds: list, **kwargs: object) -> bool:
-            self.pixel_calls.append((leds, kwargs))
-            return True
+    def fake_state_reader(timeout: float) -> int:
+        state_calls[0] += 1
+        return 10
 
-        def get_state(self, **kwargs: object) -> FakeState:
-            self.state_calls += 1
-            return FakeState()
-
-    class FakeDrone:
-        def __init__(self) -> None:
-            self.led = FakeLedAPI()
-            self.closed = False
-
-        def close(self) -> None:
-            self.closed = True
-
-    fake_drone = FakeDrone()
-    use_sverk_ros2_backend(fake_drone, state_timeout=2.0)
-    set_led("solid", "green")
-    assert fake_drone.led.effects[-1] == (
-        "fill",
-        {"r": 0, "g": 255, "b": 0, "timeout": 2.0},
+    technic_backend = TechnicROS1Backend(
+        state_timeout=2.0,
+        set_effect_proxy=fake_set_effect,
+        set_leds_proxy=fake_set_leds,
+        state_reader=fake_state_reader,
     )
+    configure_backend(technic_backend)
+
+    set_led("solid", "green")
+    assert effect_calls[-1] == {"r": 0, "g": 255, "b": 0}
+
+    set_led("blink", "yellow")
+    assert effect_calls[-1] == {
+        "r": 255,
+        "g": 255,
+        "b": 0,
+        "effect": "blink",
+    }
+
+    set_led("rainbow", None)
+    assert effect_calls[-1] == {"effect": "rainbow"}
+
     set_led("half-half", ("red", "blue"))
-    sent_leds, call_options = fake_drone.led.pixel_calls[-1]
-    assert sent_leds[:5] == [
-        (index, 255, 0, 0) for index in range(5)
-    ]
-    assert sent_leds[5:] == [
-        (index, 0, 0, 255) for index in range(5, 10)
-    ]
-    assert call_options == {"timeout": 2.0}
-    assert fake_drone.led.state_calls == 1
-    close_led_backend()
-    assert not fake_drone.closed
+    sent_leds = pixel_calls[-1]
+    assert sent_leds[:5] == [(index, 255, 0, 0) for index in range(5)]
+    assert sent_leds[5:] == [(index, 0, 0, 255) for index in range(5, 10)]
+    assert state_calls[0] == 1
 
     invalid_commands = (
         ("rainbow", "red"),

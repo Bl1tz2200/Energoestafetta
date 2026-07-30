@@ -9,11 +9,12 @@
        result = detector.detect(frame_bgr)
        print(result.to_dict())
 
-2. получать кадры через ROS 2 ``sverk_interfaces``::
+2. получать кадры на самом дроне (Skyris Technic 6S, ROS 1/rospy) через
+   ``TechnicROS1Vision``::
 
-       drone = sverk_interfaces.init(Nodename="station_vision")
-       vision = SverkStationVision(drone)
-       result = vision.detect_once(timeout=2.0, publish=True)
+       rospy.init_node('vision')  # один раз в полётном скрипте
+       vision = TechnicROS1Vision()
+       result = vision.detect_once(timeout=2.0)
 
 3. проверять отдельно на изображении, видео или USB-камере::
 
@@ -26,6 +27,14 @@
 используется словарь DICT_4X4_50, номера меток ограничены полем 0..48, а цвета
 станций — red и green. На очном этапе конкретный ID станции назначают эксперты,
 поэтому он намеренно не зашит в код.
+
+Платформа Skyris Technic 6S публикует кадры камеры на топике ROS 1
+``main_camera/image_raw`` (``sensor_msgs/Image``) и уже содержит пакет
+``aruco_pose`` (топик ``aruco_detect/markers``), который сам считает ID и
+3D-позу меток — см. docs.skyris.ru/technic6S/ArucoMarker.html. Этот модуль
+дополняет его: определяет ЦВЕТ зарядной станции (aruco_pose цвет не знает)
+и может использоваться как самостоятельный HSV+ArUco детектор на кадре из
+``cv_bridge``.
 """
 
 from __future__ import annotations
@@ -393,85 +402,61 @@ class StationVision:
         return nearest[1] if nearest is not None and nearest[0] <= 2.5 else None
 
 
-class SverkStationVision:
-    """ROS 2-адаптер камеры Sverk для ``StationVision``.
+class TechnicROS1Vision:
+    """ROS 1 (rospy + cv_bridge) адаптер камеры Skyris Technic 6S.
 
-    Адаптер принимает уже созданный ``drone`` и не закрывает его. Кадры
-    запрашиваются с ``raw=True`` и преобразуются здесь, включая фактический
-    формат бортовой камеры ``yuv422_yuy2``.
+    Требует уже поднятый узел (``rospy.init_node(...)``) — адаптер его не
+    создаёт и не закрывает. Кадры читаются с топика ``main_camera/image_raw``
+    (``sensor_msgs/Image``, кодировка ``bgr8``) через ``cv_bridge.CvBridge``
+    — см. docs.skyris.ru/technic6S/CameraImages.html и ComputerVision.html.
+
+    ``image_reader``/``subscriber_factory`` можно подменить в тестах, чтобы
+    не импортировать ``rospy``/``cv_bridge``.
     """
 
     def __init__(
         self,
-        drone: Any,
         detector: Optional[StationVision] = None,
         *,
-        image_topic: Optional[str] = None,
-        output_topic: Optional[str] = "/out_detection",
+        image_topic: str = "main_camera/image_raw",
+        image_reader: Optional[Callable[[float], "np.ndarray"]] = None,
+        subscriber_factory: Optional[
+            Callable[[str, Callable[["np.ndarray"], None]], Any]
+        ] = None,
     ) -> None:
-        image_api = getattr(drone, "image", None)
-        if image_api is None:
-            raise RuntimeError("У объекта drone отсутствует API drone.image")
-        self.drone = drone
-        self.image = image_api
         self.detector = detector or StationVision()
         self.image_topic = image_topic
-        self.output_topic = output_topic
+        self._image_reader = image_reader
+        self._subscriber_factory = subscriber_factory
         self.last_frame: Optional["np.ndarray"] = None
         self.last_result: Optional[VisionResult] = None
 
-    def take_frame(self, timeout: float = 2.0) -> Optional["np.ndarray"]:
-        """Получить один BGR-кадр из ROS 2 или вернуть None по таймауту."""
+    def take_frame(self, timeout: float = 2.0) -> "np.ndarray":
+        """Получить один BGR-кадр с ``main_camera/image_raw``."""
         if timeout <= 0:
             raise ValueError("timeout должен быть больше нуля")
-        message = self.image.take_picture(
-            topic=self.image_topic,
-            timeout=timeout,
-            raw=True,
-        )
-        if message is None:
-            return None
-        return ros_image_to_bgr(message)
+        if self._image_reader is not None:
+            return self._image_reader(timeout)
 
-    def detect_once(
-        self,
-        timeout: float = 2.0,
-        *,
-        publish: bool = False,
-    ) -> Optional[VisionResult]:
-        """Получить и обработать один кадр с камеры Sverk."""
+        import rospy
+        from cv_bridge import CvBridge
+        from sensor_msgs.msg import Image
+
+        message = rospy.wait_for_message(
+            self.image_topic, Image, timeout=timeout
+        )
+        return CvBridge().imgmsg_to_cv2(message, "bgr8")
+
+    def detect_once(self, timeout: float = 2.0) -> VisionResult:
+        """Получить и обработать один кадр с камеры дрона."""
         frame = self.take_frame(timeout=timeout)
-        if frame is None:
-            return None
-        return self.process_frame(frame, publish=publish)
+        return self.process_frame(frame)
 
-    def process_ros_image(
-        self,
-        message: Any,
-        *,
-        publish: bool = False,
-    ) -> VisionResult:
-        """Обработать готовое сообщение ``sensor_msgs/Image``."""
-        return self.process_frame(
-            ros_image_to_bgr(message),
-            publish=publish,
-        )
-
-    def process_frame(
-        self,
-        frame_bgr: "np.ndarray",
-        *,
-        publish: bool = False,
-    ) -> VisionResult:
-        """Обработать BGR-кадр и при необходимости опубликовать разметку."""
+    def process_frame(self, frame_bgr: "np.ndarray") -> VisionResult:
+        """Обработать готовый BGR-кадр."""
         result = self.detector.detect(frame_bgr)
         self.last_frame = frame_bgr
         self.last_result = result
-        if publish:
-            self.image.publish(
-                draw_result(frame_bgr, result),
-                topic=self.output_topic,
-            )
         return result
 
     def stream(
@@ -479,113 +464,33 @@ class SverkStationVision:
         callback: Optional[
             Callable[[VisionResult, "np.ndarray"], None]
         ] = None,
-        *,
-        duration: Optional[float] = None,
-        publish: bool = False,
-    ) -> None:
-        """Блокирующе обрабатывать поток ROS 2.
+    ) -> Any:
+        """Подписаться на поток кадров ROS 1 и обрабатывать их по мере поступления.
 
-        Ошибки детектора или пользовательского callback не теряются: поток
-        останавливается, после чего исходное исключение выбрасывается наружу.
+        Возвращает объект подписки (``rospy.Subscriber`` или заглушку из
+        теста) — вызывающая сторона отвечает за его закрытие/unregister.
         """
-        if duration is not None and duration <= 0:
-            raise ValueError("duration должен быть больше нуля или None")
-        errors: List[BaseException] = []
-
-        def on_message(message: Any) -> None:
-            try:
-                frame = ros_image_to_bgr(message)
-                result = self.process_frame(frame, publish=publish)
+        if self._subscriber_factory is not None:
+            def on_frame(frame: "np.ndarray") -> None:
+                result = self.process_frame(frame)
                 if callback is not None:
                     callback(result, frame)
-            except BaseException as exc:
-                errors.append(exc)
-                self.image.stop_stream()
 
-        self.image.stream(
-            on_message,
-            topic=self.image_topic,
-            duration=duration,
-            raw=True,
-        )
-        if errors:
-            raise errors[0]
+            return self._subscriber_factory(self.image_topic, on_frame)
 
+        import rospy
+        from cv_bridge import CvBridge
+        from sensor_msgs.msg import Image
 
-def ros_image_to_bgr(message: Any) -> "np.ndarray":
-    """Преобразовать ``sensor_msgs/Image`` в записываемый BGR uint8-кадр.
+        bridge = CvBridge()
 
-    Поддерживаются bgr8, rgb8, mono8, bgra8, rgba8, YUY2 и UYVY. В отличие от
-    базового ``drone.image.to_cv2`` функция учитывает ``step`` и формат
-    ``yuv422_yuy2``, который встречается у бортовой камеры Обрика.
-    """
-    if isinstance(message, np.ndarray):
-        StationVision._validate_frame(message)
-        return message.copy()
+        def on_message(message: Any) -> None:
+            frame = bridge.imgmsg_to_cv2(message, "bgr8")
+            result = self.process_frame(frame)
+            if callback is not None:
+                callback(result, frame)
 
-    try:
-        height = int(message.height)
-        width = int(message.width)
-        encoding = str(message.encoding or "").strip().lower()
-        data = message.data
-    except AttributeError as exc:
-        raise TypeError(
-            "Ожидается sensor_msgs/Image или BGR numpy.ndarray"
-        ) from exc
-
-    if height <= 0 or width <= 0:
-        raise ValueError("Некорректный размер ROS-кадра")
-
-    formats = {
-        "bgr8": (3, None),
-        "rgb8": (3, cv2.COLOR_RGB2BGR),
-        "mono8": (1, cv2.COLOR_GRAY2BGR),
-        "8uc1": (1, cv2.COLOR_GRAY2BGR),
-        "bgra8": (4, cv2.COLOR_BGRA2BGR),
-        "rgba8": (4, cv2.COLOR_RGBA2BGR),
-        "yuv422_yuy2": (2, cv2.COLOR_YUV2BGR_YUY2),
-        "yuy2": (2, cv2.COLOR_YUV2BGR_YUY2),
-        "yuyv": (2, cv2.COLOR_YUV2BGR_YUY2),
-        "yuv422": (2, cv2.COLOR_YUV2BGR_UYVY),
-        "yuv422_uyvy": (2, cv2.COLOR_YUV2BGR_UYVY),
-        "uyvy": (2, cv2.COLOR_YUV2BGR_UYVY),
-    }
-    if encoding not in formats:
-        raise ValueError(
-            "Неподдерживаемая кодировка ROS-кадра: {!r}".format(encoding)
-        )
-
-    channels, conversion = formats[encoding]
-    expected_row_bytes = width * channels
-    step = int(getattr(message, "step", 0) or expected_row_bytes)
-    if step < expected_row_bytes:
-        raise ValueError(
-            "Поле step={} меньше требуемых {} байт".format(
-                step, expected_row_bytes
-            )
-        )
-
-    try:
-        raw = np.frombuffer(data, dtype=np.uint8)
-    except TypeError:
-        raw = np.asarray(data, dtype=np.uint8).reshape(-1)
-    required_size = height * step
-    if raw.size < required_size:
-        raise ValueError(
-            "ROS-кадр обрезан: ожидалось минимум {} байт, получено {}".format(
-                required_size, raw.size
-            )
-        )
-
-    rows = raw[:required_size].reshape(height, step)
-    packed = rows[:, :expected_row_bytes].reshape(height, width, channels)
-    if channels == 1:
-        packed = packed.reshape(height, width)
-    if conversion is None:
-        frame = packed
-    else:
-        frame = cv2.cvtColor(packed, conversion)
-    return np.ascontiguousarray(frame, dtype=np.uint8)
+        return rospy.Subscriber(self.image_topic, Image, on_message)
 
 
 def draw_result(

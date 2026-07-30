@@ -5,20 +5,21 @@
     gripper_open()
     gripper_close()
 
-Для ROS 2 на платформе Sverk передайте уже созданный объект ``drone``:
+Дрон соревнования — Skyris Technic 6S (PX4 + Orange Pi 5 Pro). На этой
+платформе сервопривод НЕ управляется через ROS — используется системная
+утилита ``gpio`` (WiringPi) на самом Orange Pi
+(см. docs.skyris.ru/technic6S/GPIO.html)::
 
-    drone = sverk_interfaces.init(Nodename="fly_head")
-    use_sverk_ros2_gripper(
-        drone,
-        open_angle=20,
-        close_angle=95,
+    use_technic_gpio_gripper(
+        pin=17,
+        open_pulse=1000,
+        close_pulse=2000,
     )
 
-Перед запуском программы должна работать нода сервопривода:
-
-    ros2 launch servo_control servo.launch.py
-
-Для другого механизма по-прежнему можно использовать ``configure_gripper()``.
+``open_pulse``/``close_pulse`` — это не углы, а «сырые» значения PWM
+(аналог ширины импульса сервопривода), их нужно подобрать под конкретный
+захват по факту на площадке. Для другого механизма по-прежнему можно
+использовать ``configure_gripper()``.
 """
 
 from __future__ import annotations
@@ -67,115 +68,103 @@ def configure_gripper(
         _state = GripperState.UNKNOWN
 
 
-class SverkROS2GripperBackend:
-    """Адаптер официального ROS 2 API ``drone.gpio``.
+class TechnicGPIOBackend:
+    """Управление сервоприводом Skyris Technic 6S через утилиту ``gpio``.
 
-    Если ``drone`` не передан, backend создаёт собственный узел
-    ``sverk_interfaces`` и закрывает его в ``shutdown()``. В полётном сценарии
-    предпочтительно передавать общий объект drone.
+    На этой платформе сервопривод НЕ является ROS-сервисом: скрипт вызывает
+    системную утилиту ``gpio`` (WiringPi) на Orange Pi напрямую, как в
+    примерах docs.skyris.ru/technic6S/GPIO.html::
+
+        gpio mode <pin> pwm
+        gpio pwmr <pin> <pwm_range>
+        gpio pwmc <pin> <pwm_clock>
+        gpio pwm <pin> <value>
+
+    ``open_pulse``/``close_pulse`` — это не углы 0..180, а «сырые» значения
+    PWM (в примерах документации использовались 1000/1500/2000 при
+    ``pwm_range=20000, pwm_clock=24``). Подбираются по факту под конкретный
+    сервопривод/захват на площадке.
+
+    ``runner`` можно подменить в тестах, чтобы не вызывать реальный
+    процесс ``gpio``.
     """
 
     def __init__(
         self,
-        drone: Any | None = None,
+        pin: int,
         *,
-        open_angle: float,
-        close_angle: float,
-        channel: int = 0,
-        enable_timeout: float = 5.0,
+        open_pulse: int,
+        close_pulse: int,
+        pwm_range: int = 20000,
+        pwm_clock: int = 24,
         startup_delay: float = 0.3,
-        node_name: str = "energy_relay_gripper",
+        runner: Callable[..., None] | None = None,
     ) -> None:
-        self.open_angle = _validate_angle(open_angle, "open_angle")
-        self.close_angle = _validate_angle(close_angle, "close_angle")
-        if not isinstance(channel, int) or isinstance(channel, bool) or channel < 0:
-            raise ValueError("channel должен быть целым числом >= 0")
-        if enable_timeout <= 0:
-            raise ValueError("enable_timeout должен быть больше нуля")
+        if not isinstance(pin, int) or isinstance(pin, bool) or pin < 0:
+            raise ValueError("pin должен быть целым числом >= 0")
+        for name, value in (("open_pulse", open_pulse), ("close_pulse", close_pulse)):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(name + " должен быть положительным целым числом")
+        if pwm_range <= 0 or pwm_clock <= 0:
+            raise ValueError("pwm_range и pwm_clock должны быть больше нуля")
         if startup_delay < 0:
             raise ValueError("startup_delay не может быть отрицательным")
 
-        self.channel = channel
-        self.enable_timeout = float(enable_timeout)
-        self._owns_drone = drone is None
+        self.pin = pin
+        self.open_pulse = open_pulse
+        self.close_pulse = close_pulse
         self._closed = False
+        self._run = runner or _run_gpio_cli
 
-        if drone is None:
-            try:
-                import sverk_interfaces
-            except ImportError as exc:
-                raise RuntimeError(
-                    "sverk_interfaces недоступен. Выполните source "
-                    "/opt/ros/*/setup.bash и source ~/sverk_ws/install/setup.bash"
-                ) from exc
-            drone = sverk_interfaces.init(Nodename=node_name)
-
-        self.drone = drone
-        self.gpio = getattr(drone, "gpio", None)
-        if self.gpio is None:
-            self._close_owned_drone()
-            raise RuntimeError("У объекта drone отсутствует API drone.gpio")
-
-        try:
-            self.gpio.servo_select_channel(channel)
-            response = self.gpio.servo_enable(timeout=self.enable_timeout)
-            _ensure_ros_success(response, "/servo_control/enable")
-            if startup_delay:
-                sleep(startup_delay)
-        except Exception:
-            self._close_owned_drone()
-            raise
+        self._run("mode", pin, "pwm")
+        self._run("pwmr", pin, pwm_range)
+        self._run("pwmc", pin, pwm_clock)
+        if startup_delay:
+            sleep(startup_delay)
 
     def open(self) -> None:
         self._ensure_open()
-        self.gpio.servo_set_angle(self.open_angle)
+        self._run("pwm", self.pin, self.open_pulse)
 
     def close(self) -> None:
         self._ensure_open()
-        self.gpio.servo_set_angle(self.close_angle)
+        self._run("pwm", self.pin, self.close_pulse)
 
     def shutdown(self) -> None:
-        """Отключить PWM и закрыть только созданный этим backend ROS-узел."""
+        """Обнулить PWM на пине. Повторный вызов безопасен."""
         if self._closed:
             return
         self._closed = True
-        try:
-            response = self.gpio.servo_disable(timeout=self.enable_timeout)
-            _ensure_ros_success(response, "/servo_control/enable")
-        finally:
-            self._close_owned_drone()
+        self._run("pwm", self.pin, 0)
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("Backend захвата уже остановлен")
 
-    def _close_owned_drone(self) -> None:
-        if self._owns_drone and self.drone is not None:
-            close = getattr(self.drone, "close", None)
-            if callable(close):
-                close()
-            self.drone = None
+
+def _run_gpio_cli(*args: Any) -> None:
+    import subprocess
+
+    subprocess.run(["gpio", *map(str, args)], check=True)
 
 
-def use_sverk_ros2_gripper(
-    drone: Any | None = None,
+def use_technic_gpio_gripper(
+    pin: int,
     *,
-    open_angle: float,
-    close_angle: float,
-    channel: int = 0,
-    enable_timeout: float = 5.0,
+    open_pulse: int,
+    close_pulse: int,
+    pwm_range: int = 20000,
+    pwm_clock: int = 24,
     startup_delay: float = 0.3,
-    node_name: str = "energy_relay_gripper",
-) -> SverkROS2GripperBackend:
-    """Настроить захват через ROS 2 ``sverk_interfaces`` и включить PWM."""
-    backend = SverkROS2GripperBackend(
-        drone,
-        open_angle=open_angle,
-        close_angle=close_angle,
-        channel=channel,
-        enable_timeout=enable_timeout,
+) -> TechnicGPIOBackend:
+    """Настроить захват через ``gpio`` CLI на Skyris Technic 6S."""
+    backend = TechnicGPIOBackend(
+        pin,
+        open_pulse=open_pulse,
+        close_pulse=close_pulse,
+        pwm_range=pwm_range,
+        pwm_clock=pwm_clock,
         startup_delay=startup_delay,
-        node_name=node_name,
     )
     configure_gripper(
         open_action=backend.open,
@@ -252,17 +241,3 @@ def shutdown_gripper() -> None:
         action()
 
 
-def _validate_angle(value: float, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(name + " должен быть числом")
-    angle = float(value)
-    if not 0.0 <= angle <= 180.0:
-        raise ValueError(name + " должен лежать в диапазоне 0..180")
-    return angle
-
-
-def _ensure_ros_success(response: object, operation: str) -> None:
-    success = response is not False and getattr(response, "success", True)
-    if not success:
-        message = getattr(response, "message", "команда отклонена")
-        raise RuntimeError("{}: {}".format(operation, message))
