@@ -2,35 +2,70 @@
 
 Код для инженерного соревнования «Энергоэстафета» (Архипелаг 2026), дрон —
 Skyris Technic 6S (PX4 + Orange Pi 5 Pro, ROS 1/rospy). Подробности задания,
-регламент и план работы — в `TASK.md` и `PLAN.md`.
+регламент и план работы — в `docs/TASK.md` и `docs/PLAN.md`.
+
+## Структура репозитория
+
+```text
+.
+├── bvs1_flight.py       # запуск на дроне БВС-1
+├── bvs2_flight.py       # запуск на дроне БВС-2
+├── diagnosis.py         # диагностика на площадке без включения моторов
+├── README.md
+├── config/
+│   └── field_map.txt    # карта поля (аргумент --map)
+├── docs/
+│   ├── TASK.md          # регламент/задание
+│   └── PLAN.md          # план работы по приоритетам
+└── lib/                 # общие модули, импортируются bvs*.py/diagnosis.py
+    ├── flight_core.py
+    ├── led_interface.py
+    ├── gripper_control.py
+    ├── energy_relay_vision.py
+    ├── station_protocol.py
+    ├── mission_sync.py
+    └── flight_test_support.py
+```
+
+В основной папке — только то, что запускают напрямую на дроне/площадке
+(`bvs1_flight.py`, `bvs2_flight.py`, `diagnosis.py`) плюс этот README; вся
+общая логика вынесена в `lib/`, конфигурация поля — в `config/`, регламент и
+план — в `docs/`. Три корневых скрипта сами добавляют `lib/` в `sys.path`
+(`sys.path.insert(0, .../"lib")`), поэтому запускать их можно как обычно,
+без установки пакета и без переменных окружения — `lib/`, `config/` и
+`docs/` не заменяют друг друга, но должны переноситься на дрон вместе с
+корневыми скриптами (см. «Перенос кода на дрон» ниже).
 
 ## Файлы
 
-- `field_map.txt` — карта поля (49 ArUco-меток 7×7, шаг 1 м) в формате
-  `aruco_pose`/`aruco_map`, нужна для навигации `frame_id='aruco_map'`.
-- `flight_core.py` — общие примитивы полёта (взлёт/полёт/посадка,
+- `config/field_map.txt` — карта поля (49 ArUco-меток 7×7, шаг 1 м) в
+  формате `aruco_pose`/`aruco_map`, нужна для навигации `frame_id='aruco_map'`.
+- `lib/flight_core.py` — общие примитивы полёта (взлёт/полёт/посадка,
   чтение карты, посадка на приподнятую поверхность по дальномеру,
   имитация зарядки `simulate_charging`).
-- `led_interface.py` — управление светодиодной лентой (`set_led`).
-- `gripper_control.py` — управление захватом груза через `gpio` (Orange Pi).
-- `energy_relay_vision.py` — распознавание ArUco-меток и цвета станции.
+- `lib/led_interface.py` — управление светодиодной лентой (`set_led`).
+- `lib/gripper_control.py` — управление захватом груза через `gpio` (Orange Pi).
+- `lib/energy_relay_vision.py` — распознавание ArUco-меток и цвета станции.
 - `bvs1_flight.py` — полётный сценарий БВС-1 (взлёт → зарядная станция на
   кубе → ожидание → возврат).
 - `bvs2_flight.py` — полётный сценарий БВС-2 (взлёт → зона захвата груза →
   захват → своя зарядная станция на кубе → зарядка + сброс груза → возврат).
-- `station_protocol.py` — протокол БВС↔станция: запрос посадки/разрешение на
-  посадку через цвет ленты, «зарядка завершена» для БВС-1 через команду с
+- `diagnosis.py` — диагностика связи со всеми подсистемами (карта поля,
+  телеметрия, `aruco_map`, дальномер, камера, LED, опционально захват) БЕЗ
+  включения моторов — см. раздел «Диагностика на площадке» ниже.
+- `lib/station_protocol.py` — протокол БВС↔станция: запрос посадки/разрешение
+  на посадку через цвет ленты, «зарядка завершена» для БВС-1 через команду с
   клавиатуры.
-- `mission_sync.py` — синхронный взлёт двух БВС (`TakeoffBarrier` поверх TCP)
-  и запуск задач параллельно, с ожиданием по событию/таймауту вместо
+- `lib/mission_sync.py` — синхронный взлёт двух БВС (`TakeoffBarrier` поверх
+  TCP) и запуск задач параллельно, с ожиданием по событию/таймауту вместо
   жёсткого `sleep` (`run_concurrently`).
-- `flight_test_support.py` — общие заглушки (`FakeFlight`, `FakeClock`,
-  запись LED-команд) для `--self-test` в `bvs1_flight.py`/`bvs2_flight.py`;
-  на дрон переносить не обязательно, боевого кода не содержит.
+- `lib/flight_test_support.py` — общие заглушки (`FakeFlight`, `FakeClock`,
+  запись LED-команд) для `--self-test` в `bvs1_flight.py`/`bvs2_flight.py`/
+  `diagnosis.py`; на дрон переносить не обязательно, боевого кода не содержит.
 
-`station_protocol.py` и `mission_sync.py` — самостоятельные модули
-Приоритета 4 (см. `PLAN.md`); в `bvs1_flight.py`/`bvs2_flight.py` они пока
-не подключены — это интеграция Приоритета 5.
+`lib/station_protocol.py` и `lib/mission_sync.py` — самостоятельные модули
+Приоритета 4 (см. `docs/PLAN.md`); в `bvs1_flight.py`/`bvs2_flight.py` они
+пока не подключены — это интеграция Приоритета 5.
 
 ## Запуск БВС-1 на дроне
 
@@ -59,23 +94,25 @@ Skyris Technic 6S (PX4 + Orange Pi 5 Pro, ROS 1/rospy). Подробности �
    cat ~/technic_ws/src/technic/aruco_pose/map/map1.txt
    ```
 
-   Если содержимое не совпадает с нашим `field_map.txt` (той же
+   Если содержимое не совпадает с нашим `config/field_map.txt` (той же
    раскладкой 7×7), заменить файл и перезапустить ноду:
 
    ```bash
-   cp ~/energoestafetta/field_map.txt ~/technic_ws/src/technic/aruco_pose/map/map1.txt
+   cp ~/energoestafetta/config/field_map.txt ~/technic_ws/src/technic/aruco_pose/map/map1.txt
    rosnode kill /aruco_map   # respawn="true" в launch поднимет ноду заново
    ```
 
 3. Убедиться, что подняты MAVROS (связь с PX4) и камера/дальномер — обычно
    это тоже часть общего launch-файла платформы, отдельно поднимать не
-   требуется, если он уже настроен на дроне.
+   требуется, если он уже настроен на дроне. Быстро проверить всё сразу
+   (без риска для пропеллеров) можно скриптом `diagnosis.py` — см. раздел
+   «Диагностика на площадке» ниже.
 
 4. Запустить сам сценарий:
 
    ```bash
    python3 bvs1_flight.py \
-       --map field_map.txt \
+       --map config/field_map.txt \
        --start-marker 48 \
        --station-marker 37 \
        --station-height 0.8
@@ -98,7 +135,7 @@ Skyris Technic 6S (PX4 + Orange Pi 5 Pro, ROS 1/rospy). Подробности �
 
 ```bash
 python3 bvs2_flight.py \
-    --map field_map.txt \
+    --map config/field_map.txt \
     --start-marker <N> \
     --cargo-marker 0 \
     --station-marker 5 \
@@ -113,30 +150,61 @@ python3 bvs2_flight.py \
 `5` — это **собственная** зарядная станция БВС-2, физически отдельная от
 станции БВС-1 (метка `37` по умолчанию в `bvs1_flight.py`). `--gripper-pin`
 и `--gripper-open-pulse`/`--gripper-close-pulse` нужно подобрать под
-конкретный сервопривод/захват на площадке (см. `gripper_control.py`).
+конкретный сервопривод/захват на площадке (см. `lib/gripper_control.py`).
+
+## Диагностика на площадке (без моторов)
+
+`diagnosis.py` проверяет связь со всеми подсистемами — карту поля,
+телеметрию ROS 1/MAVROS, локализацию по `aruco_map`, видимость меток,
+дальномер, камеру/распознавание и LED-ленту — **не вызывая** `navigate()`,
+`arming(True)` или `land()`. Двигатели не включаются вообще, поэтому скрипт
+безопасен и до снятия пропеллеров, и на площадке до первого взлёта:
+
+```bash
+python3 diagnosis.py --map config/field_map.txt
+```
+
+Каждая проверка независима — если, например, камера не видит ни одной метки
+поля, дальномер и LED всё равно будут проверены и попадут в итоговый отчёт
+(`[OK]`/`[FAIL]` по каждому пункту). Пункт «Видимость меток» напрямую отвечает
+на вопрос «почему `aruco_map` не работает» — если меток не видно, локализация
+по карте не может быть верной (см. также раздел «Что проверить на площадке»
+ниже).
+
+Захват груза по умолчанию не проверяется (двигает сервопривод) — включить
+явно:
+
+```bash
+python3 diagnosis.py --test-gripper --gripper-pin <N> \
+    --gripper-open-pulse <N> --gripper-close-pulse <N>
+```
+
+Если `opencv-contrib-python`/`numpy` не установлены — пропустить проверку
+камеры/распознавания флагом `--skip-camera`, остальные проверки всё равно
+выполнятся.
 
 ## Связь и синхронизация (Приоритет 4)
 
-`station_protocol.py` и `mission_sync.py` можно опробовать в поле отдельно
-от полётных скриптов — до того, как их подключат к `bvs1_flight.py`/
-`bvs2_flight.py`.
+`lib/station_protocol.py` и `lib/mission_sync.py` можно опробовать в поле
+отдельно от полётных скриптов — до того, как их подключат к
+`bvs1_flight.py`/`bvs2_flight.py`.
 
 Координатор синхронного взлёта (`TakeoffBarrier`) — запускается один раз,
 обычно на ноутбуке оператора, видимом по сети (роутер) обоим Orange Pi:
 
 ```bash
 # на ноутбуке оператора
-python3 mission_sync.py --serve --port 5757 --parties 2
+python3 lib/mission_sync.py --serve --port 5757 --parties 2
 
 # на каждом БВС (Orange Pi)
-python3 mission_sync.py --wait --host <ip-ноутбука> --port 5757
+python3 lib/mission_sync.py --wait --host <ip-ноутбука> --port 5757
 ```
 
 Ожидание команды с клавиатуры на взлёт БВС-1 после зарядки (алгоритм
-TASK.md, шаг 5):
+docs/TASK.md, шаг 5):
 
 ```bash
-python3 station_protocol.py --wait-takeoff-command
+python3 lib/station_protocol.py --wait-takeoff-command
 ```
 
 ## Проверка без дрона (self-test)
@@ -146,19 +214,20 @@ python3 station_protocol.py --wait-takeoff-command
 ```bash
 python3 bvs1_flight.py --self-test
 python3 bvs2_flight.py --self-test
-python3 flight_core.py
-python3 led_interface.py --self-test
-python3 gripper_control.py --self-test
-python3 energy_relay_vision.py --self-test
-python3 station_protocol.py --self-test
-python3 mission_sync.py --self-test
+python3 diagnosis.py --self-test
+python3 lib/flight_core.py
+python3 lib/led_interface.py --self-test
+python3 lib/gripper_control.py --self-test
+python3 lib/energy_relay_vision.py --self-test
+python3 lib/station_protocol.py --self-test
+python3 lib/mission_sync.py --self-test
 ```
 
 Это не заменяет реальный полёт — только проверяет, что код не сломан
 синтаксически/логически (правильный порядок вызовов, LED-паттерны, расчёт
-координат по карте и т.д.). `energy_relay_vision.py` дополнительно требует
-`opencv-contrib-python`/`numpy` (см. следующий раздел) — без них скрипт сразу
-завершится понятной ошибкой, а не упадёт глубоко внутри кода.
+координат по карте и т.д.). `lib/energy_relay_vision.py` дополнительно
+требует `opencv-contrib-python`/`numpy` (см. следующий раздел) — без них
+скрипт сразу завершится понятной ошибкой, а не упадёт глубоко внутри кода.
 
 ## Перенос кода на дрон
 
@@ -180,7 +249,12 @@ python3 mission_sync.py --self-test
    ```
 
    Оба БВС и станция (если на ней тоже Python-код) — **отдельные** Orange
-   Pi/Raspberry Pi, копировать нужно на каждый по отдельности.
+   Pi/Raspberry Pi, копировать нужно на каждый по отдельности. Копируется
+   **весь репозиторий целиком** (`lib/`, `config/`, `docs/` вместе с
+   корневыми скриптами) — `rsync -avz` рекурсивен по умолчанию, отдельно
+   про подкаталоги заботиться не нужно, но если копируете вручную (`scp`
+   по одному файлу) — не забудьте `lib/` и `config/`, без них корневые
+   скрипты не запустятся (`ModuleNotFoundError`/`FileNotFoundError`).
 
 2. **Прогнать самотесты на самом Orange Pi**, а не только на ноутбуке —
    версия Python и установленные пакеты на борту могут отличаться:
@@ -189,28 +263,31 @@ python3 mission_sync.py --self-test
    ssh orangepi@<ip-бвс>
    cd ~/energoestafetta
    python3 bvs1_flight.py --self-test   # и остальные модули, см. выше
+   python3 diagnosis.py --self-test
    ```
 
    Если не проходит — почти всегда это версия Python (регламент требует
    3.8) или отсутствующий пакет, а не полётная логика (она уже проверена на
-   ноутбуке); `energy_relay_vision.py --self-test` первым укажет на
+   ноутбуке); `lib/energy_relay_vision.py --self-test` первым укажет на
    отсутствие `opencv-contrib-python`/`numpy` понятным сообщением.
 
-3. **Обновить карту поля на платформе**, если раскладка `field_map.txt`
+3. **Обновить карту поля на платформе**, если раскладка `config/field_map.txt`
    изменилась — это отдельный файл от `aruco_pose`, платформенная нода
    берёт свою копию, см. «Запуск БВС-1 на дроне», п. 2 выше:
 
    ```bash
-   cp ~/energoestafetta/field_map.txt ~/technic_ws/src/technic/aruco_pose/map/map1.txt
+   cp ~/energoestafetta/config/field_map.txt ~/technic_ws/src/technic/aruco_pose/map/map1.txt
    rosnode kill /aruco_map
    ```
 
-4. **Проверить окружение ROS 1** уже на Orange Pi перед реальным запуском
-   (самотесты его не используют и не заменяют):
+4. **Проверить окружение ROS 1 и все подсистемы уже на Orange Pi** перед
+   реальным запуском (самотесты выше их не используют и не заменяют) —
+   для этого и нужен `diagnosis.py`, он безопасен без пропеллеров:
 
    ```bash
    source /opt/ros/noetic/setup.bash
    source ~/technic_ws/devel/setup.bash
+   python3 diagnosis.py --map config/field_map.txt
    ```
 
 5. **Права на исполнение** — большинство скриптов уже отмечены
@@ -219,8 +296,9 @@ python3 mission_sync.py --self-test
    если нужен прямой запуск `./bvs1_flight.py`:
 
    ```bash
-   chmod +x bvs1_flight.py bvs2_flight.py flight_core.py led_interface.py \
-       gripper_control.py station_protocol.py mission_sync.py
+   chmod +x bvs1_flight.py bvs2_flight.py diagnosis.py \
+       lib/flight_core.py lib/led_interface.py lib/gripper_control.py \
+       lib/station_protocol.py lib/mission_sync.py
    ```
 
 6. **Если правки делаются прямо в поле** (на Orange Pi, без ноутбука) —
@@ -228,21 +306,28 @@ python3 mission_sync.py --self-test
    `rsync`), иначе они потеряются при переустановке образа/следующей
    синхронизации с ноутбука.
 
-Итоговый порядок перед каждой попыткой: самотесты на ноутбуке → перенос на
-оба Orange Pi → самотесты там же → проверка карты поля/окружения ROS →
+Итоговый порядок перед каждой попыткой: самотесты на ноутбуке → перенос
+**всего дерева** (`lib/`, `config/`, корневые скрипты) на оба Orange Pi →
+самотесты там же → `diagnosis.py` для проверки карты поля/окружения ROS →
 реальный запуск по инструкциям ниже.
 
 ## Что проверить на площадке в первый день
 
-- ~~Направление нумерации `field_map.txt` реально совпадает с физической
-  раскладкой поля~~ — подтверждено на площадке: метка `0` в верхнем левом
-  углу, `6` в верхнем правом, `48` в нижнем правом — совпадает с порядком
-  в `field_map.txt` (строки сверху вниз, внутри строки слева направо).
+`diagnosis.py` (см. выше) закрывает бо́льшую часть этого списка автоматически
+и без риска для пропеллеров — начинайте с него, а не с ручной проверки.
+
+- ~~Направление нумерации `config/field_map.txt` реально совпадает с
+  физической раскладкой поля~~ — подтверждено на площадке: метка `0` в
+  верхнем левом углу, `6` в верхнем правом, `48` в нижнем правом — совпадает
+  с порядком в `config/field_map.txt` (строки сверху вниз, внутри строки
+  слева направо).
 - ~~Точное имя команды/launch-файла для подъёма `aruco_map`~~ — выяснено:
   nodelet `aruco_pose/aruco_map`, поднимается автоматически платформенным
   `technic.launch` → `aruco.launch`, карта берётся из
   `aruco_pose/map/map1.txt` (см. шаг 2 выше). Осталось только сверить
-  содержимое `map1.txt` с `field_map.txt` на площадке.
+  содержимое `map1.txt` с `config/field_map.txt` на площадке (или прогнать
+  `diagnosis.py` — пункт «Локализация по aruco_map»/«Видимость меток»
+  сразу покажет, если карта или видимость меток не в порядке).
 - Имя сервиса армирования `mavros/cmd/arming` (стандартное для MAVROS, но не
   подтверждено явно документацией Skyris).
 - Порог дальномера и шаг спуска в `controlled_descent_and_disarm` — надо
@@ -252,10 +337,10 @@ python3 mission_sync.py --self-test
   `--pickup-altitude` и задержка захвата — подобрать под конкретный
   сервопривод/магнит и груз.
 
-Для координатора синхронного взлёта (`mission_sync.py --serve`) — адрес и
-порт ноутбука оператора должны быть реально доступны обоим Orange Pi по
+Для координатора синхронного взлёта (`lib/mission_sync.py --serve`) — адрес
+и порт ноутбука оператора должны быть реально доступны обоим Orange Pi по
 сети (роутер из комплекта); проверить на площадке в первый день вместе с
 остальными допущениями.
 
-Подробнее — в `TASK.md` (раздел «Уже реализовано») и `PLAN.md` (пункты 3.1,
-3.2, 4.1, 4.2).
+Подробнее — в `docs/TASK.md` (раздел «Уже реализовано») и `docs/PLAN.md`
+(пункты 3.1, 3.2, 4.1, 4.2).

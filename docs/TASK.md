@@ -148,7 +148,7 @@ OpenCV; актуальность Zadig/Cfclient/RobboScratch стоит уточ
 Расположение объектов может меняться от попытки к попытке, но известно
 заранее — значит id меток и высота куба задаются конфигом/аргументами
 командной строки перед каждым запуском, а не хардкодятся в логике. См.
-`field_map.txt`, `flight_core.py`, `bvs1_flight.py`.
+`config/field_map.txt`, `lib/flight_core.py`, `bvs1_flight.py`.
 
 Ключевое следствие: раз метка станции физически закрыта кубом, лететь «по
 видимой метке» нельзя — нужна глобальная локализация по карте поля
@@ -161,16 +161,16 @@ OpenCV; актуальность Zadig/Cfclient/RobboScratch стоит уточ
 
 ## Уже реализовано
 
-- `led_interface.py` — `set_led(pattern, color)`, backend
+- `lib/led_interface.py` — `set_led(pattern, color)`, backend
   `use_technic_ros1_backend()` (сервисы `led/set_effect`/`led/set_leds`).
-- `gripper_control.py` — `gripper_open()`/`gripper_close()`, backend
+- `lib/gripper_control.py` — `gripper_open()`/`gripper_close()`, backend
   `use_technic_gpio_gripper()` (утилита `gpio` на Orange Pi, без ROS).
-- `energy_relay_vision.py` — `StationVision` (HSV-детектор цвета станции +
+- `lib/energy_relay_vision.py` — `StationVision` (HSV-детектор цвета станции +
   опциональный ArUco) и `TechnicROS1Vision` (кадр с `main_camera/image_raw`
   через `cv_bridge`).
-- `field_map.txt` — карта поля 7×7 в формате `aruco_pose`/`aruco_map`
+- `config/field_map.txt` — карта поля 7×7 в формате `aruco_pose`/`aruco_map`
   (`id size x y z rot_z rot_y rot_x`), нумерация от левого верхнего угла.
-- `flight_core.py` — общие ROS1-примитивы полёта: `init_flight`,
+- `lib/flight_core.py` — общие ROS1-примитивы полёта: `init_flight`,
   `navigate_wait`, `land_wait`, `wait_until_stable`, `read_map`, `marker_xy`,
   `read_rangefinder_ros`, `controlled_descent_and_disarm`.
 - `bvs1_flight.py` — полный сценарий БВС-1: взлёт с метки 48 → полёт к
@@ -181,7 +181,7 @@ OpenCV; актуальность Zadig/Cfclient/RobboScratch стоит уточ
   (шаги 2, 4, 6, 7 алгоритма) — ещё не реализованы.
 
 **Проверить на площадке в первый день** (допущения, сделанные без доступа к
-реальному ROS 1/дрону): направление нумерации `field_map.txt` действительно
+реальному ROS 1/дрону): направление нумерации `config/field_map.txt` действительно
 совпадает с физическим полем; имя сервиса армирования
 `mavros/cmd/arming` — стандартное для MAVROS, но не подтверждено явно
 документацией Skyris; порог дальномера/шаг спуска в

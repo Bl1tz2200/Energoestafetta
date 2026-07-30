@@ -30,7 +30,7 @@ docs.skyris.ru/technic6S/ArucoMap.html), а не по прямому визуа�
 
 Запуск на дроне::
 
-    python3 bvs2_flight.py --map field_map.txt --start-marker <N> \\
+    python3 bvs2_flight.py --map config/field_map.txt --start-marker <N> \\
         --cargo-marker 0 --station-marker 5 --station-height 0.8 \\
         --gripper-pin <N> --gripper-open-pulse <N> --gripper-close-pulse <N>
 
@@ -42,10 +42,14 @@ docs.skyris.ru/technic6S/ArucoMap.html), а не по прямому визуа�
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from time import sleep
 from typing import Callable, Dict, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 import flight_core as fc
 import gripper_control as gripper
@@ -66,7 +70,7 @@ class MissionConfig:
     """Все настраиваемые параметры попытки — редактируются здесь/через CLI,
     без правки логики ``run_mission``."""
 
-    map_path: str = "field_map.txt"
+    map_path: str = "config/field_map.txt"
     start_marker_id: int = 0
     cargo_marker_id: int = 0
     station_marker_id: int = 5

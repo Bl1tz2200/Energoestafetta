@@ -18,7 +18,7 @@ docs.skyris.ru/technic6S/ArucoMap.html), а не по прямому визуа�
 
 Запуск на дроне::
 
-    python3 bvs1_flight.py --map field_map.txt --start-marker 48 \\
+    python3 bvs1_flight.py --map config/field_map.txt --start-marker 48 \\
         --station-marker 37 --station-height 0.8
 
 Проверка модуля без ROS 1/дрона::
@@ -29,10 +29,14 @@ docs.skyris.ru/technic6S/ArucoMap.html), а не по прямому визуа�
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from time import sleep
 from typing import Callable, Dict, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 import flight_core as fc
 import led_interface as led
@@ -43,7 +47,7 @@ class MissionConfig:
     """Все настраиваемые параметры попытки — редактируются здесь/через CLI,
     без правки логики ``run_mission``."""
 
-    map_path: str = "field_map.txt"
+    map_path: str = "config/field_map.txt"
     start_marker_id: int = 48
     station_marker_id: int = 37
     station_height_m: float = 0.8
