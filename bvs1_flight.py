@@ -377,7 +377,28 @@ def main() -> int:
     proxies = fc.init_flight(config.node_name)
     led.use_technic_ros1_backend()
     try:
-        run_mission(proxies, markers, config, verbose=not args.quiet)
+        try:
+            run_mission(proxies, markers, config, verbose=not args.quiet)
+        except Exception as exc:
+            # Любая необработанная ошибка миссии (таймаут навигации и т.д.)
+            # раньше оставляла дрон висеть armed без дальнейших команд -
+            # воспроизведено на площадке 2026-08-01. Вместо этого пробуем
+            # штатную посадку, прежде чем пробросить исключение дальше.
+            print(
+                "[main] авария в run_mission ({}: {}) - аварийная посадка".format(
+                    type(exc).__name__, exc
+                )
+            )
+            try:
+                fc.land_wait(proxies.land, proxies.get_telemetry, verbose=not args.quiet)
+            except Exception as land_exc:
+                print(
+                    "[main] аварийная посадка тоже не удалась ({}: {}) - "
+                    "дрон может остаться armed, вмешаться вручную (RC/killswitch)".format(
+                        type(land_exc).__name__, land_exc
+                    )
+                )
+            raise
     finally:
         led.close_led_backend()
     return 0

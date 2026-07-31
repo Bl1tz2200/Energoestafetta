@@ -503,7 +503,27 @@ def main() -> int:
         close=lambda: gripper.gripper_close(),
     )
     try:
-        run_mission(proxies, gripper_proxy, markers, config)
+        try:
+            run_mission(proxies, gripper_proxy, markers, config)
+        except Exception as exc:
+            # См. bvs1_flight.py: необработанная ошибка миссии раньше
+            # оставляла дрон armed без дальнейших команд - вместо этого
+            # пробуем штатную посадку, прежде чем пробросить исключение.
+            print(
+                "[main] авария в run_mission ({}: {}) - аварийная посадка".format(
+                    type(exc).__name__, exc
+                )
+            )
+            try:
+                fc.land_wait(proxies.land, proxies.get_telemetry)
+            except Exception as land_exc:
+                print(
+                    "[main] аварийная посадка тоже не удалась ({}: {}) - "
+                    "дрон может остаться armed, вмешаться вручную (RC/killswitch)".format(
+                        type(land_exc).__name__, land_exc
+                    )
+                )
+            raise
     finally:
         led.close_led_backend()
         backend.shutdown()
