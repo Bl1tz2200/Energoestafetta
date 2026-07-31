@@ -50,6 +50,7 @@ python3 bvs1_flight.py --self-test
 python3 bvs2_flight.py --self-test
 python3 diagnosis.py --self-test
 python3 lib/flight_core.py            # без флага, самотест — единственная точка входа
+python3 lib/flight_nav.py --self-test
 python3 lib/led_interface.py --self-test
 python3 lib/gripper_control.py --self-test
 python3 lib/energy_relay_vision.py --self-test
@@ -58,9 +59,9 @@ python3 lib/mission_sync.py --self-test
 ```
 
 Запускать все, что зависит от изменённого модуля, при любой правке в
-`lib/flight_core.py`/`lib/led_interface.py`/`lib/gripper_control.py` —
-сценарии БВС, `diagnosis.py` и межбортовой протокол зависят от них
-напрямую. `lib/gripper_control.py` тестируется через `TechnicGPIOBackend(
+`lib/flight_core.py`/`lib/flight_nav.py`/`lib/led_interface.py`/
+`lib/gripper_control.py` — сценарии БВС, `diagnosis.py` и межбортовой
+протокол зависят от них напрямую. `lib/gripper_control.py` тестируется через `TechnicGPIOBackend(
 runner=...)` — конструктор принимает `runner` для подмены реального процесса
 `gpio`, поэтому самотест возможен без Orange Pi (не путать с самим
 сервоприводом/захватом — их поведение самотест не проверяет).
@@ -101,26 +102,33 @@ ROS 1, картой `aruco_map` и переносом кода на Orange Pi (�
 
 1. **Инфраструктурные примитивы** (`lib/`) — не знают про конкретную миссию:
    - `lib/flight_core.py` — навигация/посадка/дальномер (`navigate_wait`,
-     `land_wait`, `wait_until_stable`, `controlled_descent_and_disarm`,
-     `read_map`/`marker_xy` для карты `aruco_map`, `simulate_charging` для
-     имитации зарядки по Табл.1). Плюс локализация по видимым меткам перед
-     полётом по `aruco_map` (`read_visible_marker_ids_ros`,
-     `wait_for_markers_visible`, `nearest_marker_id`) и полёт «от метки к
-     метке» вместо одного длинного прыжка (`marker_path` — растеризация пути
-     по решётке поля алгоритмом Брезенхэма, `fly_marker_path` — сам перелёт
-     с остановкой/стабилизацией на каждой метке пути). Добавлено после
-     аварии на площадке: дрон улетел на скорости вперёд и врезался в сетку,
-     ни разу не подтвердив локализацию видимой меткой (см. docstring
-     `wait_for_markers_visible`) — теперь `bvs1_flight.py`/`bvs2_flight.py`
-     после взлёта сперва стабилизируются над реально видимой меткой и только
-     потом летят по `aruco_map`, причём каждый последующий перегон — тоже
-     короткий шаг решётки со стабилизацией, а не резкий прыжок (дрон
-     крупный). Посадка на куб станции сделана управляемым
-     спуском с контролем `/rangefinder/range` и ручным дизармом, а не
-     штатным `land()` — поведение `land()` на приподнятой поверхности не
+     `land_wait`, `wait_until_stable`, `hover_in_place`,
+     `controlled_descent_and_disarm`, `read_map`/`marker_xy` для карты
+     `aruco_map`, `simulate_charging` для имитации зарядки по Табл.1) и
+     чтение видимых меток (`read_visible_marker_ids_ros`,
+     `wait_for_markers_visible`, `nearest_marker_id`). `navigate_wait`
+     принимает `guard` — функцию, которая вызывается на каждой итерации
+     ожидания и может прервать уже отданную (асинхронную) команду
+     `navigate()`; иначе прервать её нечем. Посадка на куб станции сделана
+     управляемым спуском с контролем `/rangefinder/range` и ручным дизармом,
+     а не штатным `land()` — поведение `land()` на приподнятой поверхности не
      описано в документации Skyris. `simulate_charging` принимает
      `set_led_fn` явным аргументом, а не импортирует `led_interface` —
-     слой primitives не должен знать про LED-модуль.
+     слой primitives не должен знать про LED-модуль. `marker_path`/
+     `fly_marker_path` (маршрут по узлам решётки меток) — **устаревший
+     подход**, оставлен только ради `bvs2_flight.py`; в новых сценариях
+     использовать `flight_nav.fly_to`.
+   - `lib/flight_nav.py` — безопасное перемещение по полю поверх
+     `flight_core`: геозона (`Geofence.from_markers`), проверка
+     достоверности локализации (`read_localization` — сверка позиции
+     `aruco_map` с реально видимыми метками; `wait_for_localization`),
+     сторож перегона (`geofence_guard` для `navigate_wait(guard=...)`) и сам
+     перелёт (`plan_legs`/`fly_to` — прямая к цели короткими перегонами с
+     перечитыванием позиции перед каждым, режимы `map`/`relative`).
+     Появился после аварии 2026-08-01: БВС-1 шёл «по меткам» решётки от
+     неверного якоря, вышел за поле и упал. Полный разбор причин — в
+     докстринге модуля; **при правках рядом не убирай проверки
+     согласованности и геозону — это и есть то, чего не хватало**.
    - `lib/led_interface.py` — `set_led(pattern, color)` через
      `LEDController`/`LEDBackend`; есть `ConsoleBackend` и `CallbackBackend`
      для тестов/симуляции помимо `TechnicROS1Backend`.
@@ -146,18 +154,25 @@ ROS 1, картой `aruco_map` и переносом кода на Orange Pi (�
 
 3. **Полётные сценарии и диагностика** (корень репозитория) — собирают слои
    1 и 2 в конкретный сценарий:
-   - `bvs1_flight.py` — `MissionConfig` + `run_mission`: взлёт с
-     `--start-marker` (вертикально, `frame_id='body'` — не зависит от того,
-     как повёрнут дрон по yaw на старте) → подтверждение локализации по
-     реально видимой метке (`fc.wait_for_markers_visible`/`nearest_marker_id`)
-     и стабилизация над ней → полёт к `--station-marker` «от метки к метке»
-     по решётке `aruco_map` (`fc.marker_path`/`fly_marker_path`, без резких
-     прыжков) → стабилизация → управляемый спуск на куб → зарядка через
+   - `bvs1_flight.py` — `MissionConfig` + `run_mission`: предполётная сверка
+     локализации на земле → взлёт на `--check-altitude` (вертикально,
+     `frame_id='body'` — не зависит от того, как повёрнут дрон по yaw на
+     старте) → сверка позиции со стартовой меткой
+     (`flight_nav.read_localization`) → набор крейсерской высоты и повторная
+     сверка → перелёт к `--station-marker` по прямой короткими перегонами
+     (`flight_nav.fly_to`, режим `--nav-mode map|relative`, под сторожем
+     геозоны) → стабилизация → управляемый спуск на куб → зарядка через
      `fc.simulate_charging` (сейчас заглушка на таймере вместо честного
-     протокола станции) → тем же способом обратно и обычная посадка.
+     протокола станции) → вертикальный взлёт с куба в `body` → тем же
+     способом обратно и обычная посадка. Любая ошибка навигации/локализации
+     гасит движение (`fc.hover_in_place`) и приводит к посадке — миссия не
+     продолжается вслепую.
    - `bvs2_flight.py` — то же плюс захват груза с `--cargo-marker` через
      `gripper_control` и своя (физически отдельная от БВС-1) зарядная
-     станция `--station-marker`.
+     станция `--station-marker`. **Ещё не переведён на `flight_nav`** —
+     летит по прежнему маршруту через узлы решётки меток
+     (`fc.marker_path`/`fly_marker_path`) со всеми рисками, из-за которых
+     переписан БВС-1.
    - `diagnosis.py` — `run_diagnosis`: те же ROS-подсистемы (`get_telemetry`
      в кадрах `body`/`aruco_map`, видимость меток `aruco_detect/markers` — по
      конкретным ID через `flight_core.read_visible_marker_ids_ros`, дальномер,
@@ -194,3 +209,9 @@ ROS 1, картой `aruco_map` и переносом кода на Orange Pi (�
   `flight_core.init_flight`).
 - Пороги дальномера/шаг спуска в `controlled_descent_and_disarm` — начальные
   значения, требуют калибровки по факту на кубе 80 см.
+- `max_marker_distance` (2.5 м) в `flight_nav.read_localization` — зависит
+  от высоты полёта и угла обзора камеры; проверяется пунктом
+  «Согласованность aruco_map с метками» в `diagnosis.py`.
+- Режим `--nav-mode relative` (перелёт смещениями в `body`) и `--hold-yaw`
+  (`yaw=NaN` = «сохранять курс», синтаксис Clover) на реальном дроне не
+  проверялись.

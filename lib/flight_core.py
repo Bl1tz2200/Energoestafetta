@@ -165,9 +165,11 @@ def navigate_wait(
     speed: float = 0.5,
     frame_id: str = "aruco_map",
     auto_arm: bool = False,
+    yaw: Optional[float] = None,
     tolerance: float = 0.2,
     timeout: float = 30.0,
     poll_interval: float = 0.2,
+    guard: Optional[Callable[[], None]] = None,
     sleep_fn: Callable[[float], None] = sleep,
     time_fn: Callable[[], float] = time.monotonic,
     verbose: bool = False,
@@ -185,6 +187,21 @@ def navigate_wait(
     в ней в принципе недостижима и цикл всегда упирается в timeout,
     независимо от реального поведения дрона (воспроизведено на площадке
     2026-08-01 на взлёте с ``frame_id='body'``).
+
+    ``guard`` (если передан) вызывается на каждой итерации ожидания **до**
+    проверки прибытия и должен бросить исключение, если продолжать полёт
+    опасно (выход за геозону, потеря локализации — см.
+    ``flight_nav.geofence_guard``). Это единственный способ прервать уже
+    отданную команду navigate(): сам сервис асинхронный и без такого
+    контроля дрон летит к цели до таймаута, даже если цель заведомо
+    неверна (авария на площадке — вылет за поле).
+
+    ``yaw`` по умолчанию не передаётся в navigate() вообще — используется
+    значение сервиса по умолчанию (0 в указанном ``frame_id``: для ``body``
+    это «не менять курс», для ``aruco_map`` — «развернуться носом по оси X
+    карты»). ``yaw=float('nan')`` в Clover-совместимом API означает
+    «сохранять текущий курс» — на Skyris не подтверждено, поэтому включается
+    явным флагом (см. ``--hold-yaw`` в bvs1_flight.py), а не по умолчанию.
     """
     if tolerance <= 0:
         raise ValueError("tolerance должен быть больше нуля")
@@ -194,12 +211,26 @@ def navigate_wait(
     if verbose:
         print(
             "[navigate_wait] navigate(x={:.2f}, y={:.2f}, z={:.2f}, speed={}, "
-            "frame_id={!r}, auto_arm={})".format(x, y, z, speed, frame_id, auto_arm)
+            "frame_id={!r}, auto_arm={}, yaw={})".format(
+                x, y, z, speed, frame_id, auto_arm, yaw
+            )
         )
-    navigate(x=x, y=y, z=z, speed=speed, frame_id=frame_id, auto_arm=auto_arm)
+    request: Dict[str, Any] = {
+        "x": x,
+        "y": y,
+        "z": z,
+        "speed": speed,
+        "frame_id": frame_id,
+        "auto_arm": auto_arm,
+    }
+    if yaw is not None:
+        request["yaw"] = yaw
+    navigate(**request)
 
     deadline = time_fn() + timeout
     while True:
+        if guard is not None:
+            guard()
         telemetry = get_telemetry(frame_id="navigate_target")
         distance = _distance_3d(telemetry, 0.0, 0.0, 0.0)
         if verbose:
@@ -218,6 +249,25 @@ def navigate_wait(
                 )
             )
         sleep_fn(poll_interval)
+
+
+def hover_in_place(
+    navigate: Callable[..., Any],
+    *,
+    speed: float = 0.5,
+    verbose: bool = False,
+) -> None:
+    """Немедленно погасить перемещение: удержание собственной текущей точки.
+
+    ``navigate(x=0, y=0, z=0, frame_id='body')`` — это «цель = там, где я
+    сейчас», то есть штатный способ остановиться, не садясь и не дизармя.
+    Нужен как первая реакция на любую аварийную ситуацию в полёте (потеря
+    локализации, выход за геозону): прервать уже отданную асинхронную команду
+    navigate() иначе нечем — новая команда просто заменяет старую цель.
+    """
+    if verbose:
+        print("[hover_in_place] стоп: navigate(0, 0, 0, frame_id='body')")
+    navigate(x=0.0, y=0.0, z=0.0, speed=speed, frame_id="body", auto_arm=False)
 
 
 def land_wait(
@@ -428,6 +478,15 @@ def marker_path(
     диагонали: дрон идёт «метка за меткой» и не теряет локализацию по
     aruco_map между стартом и целью (см. docstring wait_for_markers_visible
     про то, к какой аварии на площадке привёл прямой прыжок).
+
+    **Устарело для новых сценариев.** Маршрут по узлам решётки строится один
+    раз от метки-якоря и дальше выполняется вслепую: ошибка в выборе якоря
+    или расхождение aruco_map с полем разворачивают весь маршрут в сторону -
+    так БВС-1 и вышел за пределы поля (авария 2026-08-01, разбор в докстринге
+    ``flight_nav``). В ``bvs1_flight.py`` заменено на ``flight_nav.fly_to``:
+    прямая к цели, нарезанная на короткие перегоны, с перепроверкой позиции
+    перед каждым. Здесь остаётся, пока на новый способ не переведён
+    ``bvs2_flight.py``.
     """
     if start_id not in markers:
         raise KeyError("Метка {} отсутствует в карте поля".format(start_id))
@@ -472,6 +531,8 @@ def fly_marker_path(
     stabilize_tolerance: float = 0.2,
     stabilize_hold: float = 0.5,
     stabilize_timeout: float = 5.0,
+    marker_id_reader: Optional[Callable[[float], Sequence[int]]] = None,
+    markers_visible_timeout: float = 10.0,
     sleep_fn: Callable[[float], None] = sleep,
     time_fn: Callable[[], float] = time.monotonic,
     verbose: bool = False,
@@ -479,10 +540,22 @@ def fly_marker_path(
     """Пролететь путь меток ``path`` (см. ``marker_path``) от второго элемента
     до последнего, стабилизируясь над каждой меткой перед следующим перегоном.
 
+    **Устарело для новых сценариев** вместе с ``marker_path`` — см. примечание
+    там же и ``flight_nav.fly_to``. Используется только ``bvs2_flight.py``.
+
     Дрон крупный: резкий перелёт большим прыжком (пропуская промежуточные
     метки) непредсказуем так же, как один длинный прыжок через всё поле -
     поэтому каждый перегон короткий (один шаг решётки) и завершается
     стабилизацией, а не только прибытием в допуск ``navigate_wait``.
+
+    Если передан ``marker_id_reader``, после стабилизации на каждой
+    промежуточной метке дополнительно подтверждается, что камера всё ещё
+    видит хоть одну метку поля (``wait_for_markers_visible``) - без этого
+    видимость проверялась только один раз сразу после взлёта, а дальше
+    ``aruco_map`` мог стать недостоверным (например, из-за потери видимости
+    в пути) незамеченным до самого прибытия. ``marker_id_reader=None``
+    сохраняет прежнее поведение без проверки (например, для самотестов, где
+    это не нужно).
     """
     for marker_id in path[1:]:
         leg_x, leg_y = marker_xy(markers, marker_id)
@@ -512,6 +585,14 @@ def fly_marker_path(
             time_fn=time_fn,
             verbose=verbose,
         )
+        if marker_id_reader is not None:
+            wait_for_markers_visible(
+                marker_id_reader,
+                timeout=markers_visible_timeout,
+                sleep_fn=sleep_fn,
+                time_fn=time_fn,
+                verbose=verbose,
+            )
 
 
 def controlled_descent_and_disarm(
@@ -723,6 +804,62 @@ def _self_test() -> int:
     else:
         raise AssertionError("Ожидался TimeoutError")
 
+    # navigate_wait: yaw передаётся в navigate() только если задан явно
+    # (иначе используется значение сервиса по умолчанию - см. докстринг)
+    assert "yaw" not in navigate_calls[-1]
+    clock[0] = 0.0
+    navigate_wait(
+        fake_navigate,
+        lambda **_kwargs: FakeTelemetry(0.0, 0.0, 0.0),
+        x=1.0,
+        y=1.0,
+        z=1.5,
+        yaw=float("nan"),
+        timeout=1.0,
+        sleep_fn=fake_sleep,
+        time_fn=fake_time,
+    )
+    assert "yaw" in navigate_calls[-1]
+
+    # navigate_wait: guard прерывает уже отданную команду navigate() - без
+    # этого дрон летит к неверной цели до самого таймаута (авария на площадке)
+    class GuardTripped(RuntimeError):
+        pass
+
+    guard_calls = [0]
+
+    def tripping_guard() -> None:
+        guard_calls[0] += 1
+        if guard_calls[0] >= 2:
+            raise GuardTripped("сторож сработал")
+
+    clock[0] = 0.0
+    try:
+        navigate_wait(
+            fake_navigate,
+            fake_get_telemetry_far,  # цель никогда не достигается
+            x=0.0,
+            y=0.0,
+            z=0.0,
+            timeout=30.0,
+            poll_interval=0.2,
+            guard=tripping_guard,
+            sleep_fn=fake_sleep,
+            time_fn=fake_time,
+        )
+    except GuardTripped:
+        pass
+    else:
+        raise AssertionError("Ожидался GuardTripped - guard должен прерывать ожидание")
+    assert clock[0] < 30.0  # прервались раньше таймаута, а не после него
+
+    # hover_in_place: удержание собственной точки, без посадки и дизарма
+    hover_calls: List[Dict[str, Any]] = []
+    hover_in_place(lambda **kwargs: hover_calls.append(kwargs))
+    assert hover_calls == [
+        {"x": 0.0, "y": 0.0, "z": 0.0, "speed": 0.5, "frame_id": "body", "auto_arm": False}
+    ]
+
     # land_wait: телеметрия сообщает о дизарме после land()
     land_calls = []
 
@@ -859,6 +996,56 @@ def _self_test() -> int:
     assert len(fly_navigate_calls) == len(path) - 1  # первый элемент пути - старт, не перегон
     assert (fly_navigate_calls[-1]["x"], fly_navigate_calls[-1]["y"]) == grid_markers[37][:2]
     assert fly_stable_reads > 0  # действительно стабилизировался на каждой метке, а не просто прилетел
+
+    # fly_marker_path: с marker_id_reader подтверждает видимость меток на
+    # каждой промежуточной остановке, а не только сразу после взлёта.
+    fly_navigate_calls.clear()
+    fly_state["x"], fly_state["y"], fly_state["z"] = 0.0, 0.0, 0.0
+    marker_reader_calls = 0
+
+    def fake_marker_reader_always_visible(_timeout: float) -> Tuple[int, ...]:
+        nonlocal marker_reader_calls
+        marker_reader_calls += 1
+        return (1,)
+
+    clock[0] = 0.0
+    fly_marker_path(
+        fake_fly_navigate,
+        fake_fly_get_telemetry,
+        grid_markers,
+        path,
+        z=1.5,
+        speed=0.3,
+        stabilize_hold=0.3,
+        stabilize_timeout=2.0,
+        marker_id_reader=fake_marker_reader_always_visible,
+        sleep_fn=fake_sleep,
+        time_fn=fake_time,
+    )
+    assert marker_reader_calls == len(path) - 1  # проверка на каждом перегоне, не только один раз
+
+    # fly_marker_path: если метки пропадают из виду в пути, останавливается
+    # ошибкой вместо того, чтобы долететь до цели вслепую.
+    clock[0] = 0.0
+    try:
+        fly_marker_path(
+            fake_fly_navigate,
+            fake_fly_get_telemetry,
+            grid_markers,
+            path,
+            z=1.5,
+            speed=0.3,
+            stabilize_hold=0.3,
+            stabilize_timeout=2.0,
+            marker_id_reader=lambda _timeout: (),
+            markers_visible_timeout=1.0,
+            sleep_fn=fake_sleep,
+            time_fn=fake_time,
+        )
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("Ожидался TimeoutError - метки пропали из виду в пути")
 
     # controlled_descent_and_disarm: касание определяется дальномером
     descent_navigate_calls = []

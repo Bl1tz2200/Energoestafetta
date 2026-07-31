@@ -21,18 +21,25 @@
    read_visible_marker_ids_ros`), не только их число — если меток не видно,
    `aruco_map` из проверки выше не может быть верным, это самая частая
    причина «ошибок с aruco_map» на площадке.
-5. Лазерный дальномер — топик `/rangefinder/range`.
-6. Камера — топик `main_camera/image_raw`, и если установлены
+5. Согласованность `aruco_map` с видимыми метками
+   (`flight_nav.read_localization`) — позиция из п.3 сверяется с картой поля
+   и метками из п.4. Ловит случай, когда локализация уверенно отдаёт
+   позицию с другого конца поля: п.3 и п.4 по отдельности при этом
+   «зелёные», а полёт по такой карте уводит дрон за пределы поля (авария
+   БВС-1 2026-08-01). **Это первое, что надо смотреть, если дрон летит не
+   туда.**
+6. Лазерный дальномер — топик `/rangefinder/range`.
+7. Камера — топик `main_camera/image_raw`, и если установлены
    `opencv-contrib-python`/`numpy` — дополнительно прогон через
    `energy_relay_vision.StationVision` на полученном кадре.
-7. LED-лента — короткая тестовая последовательность цветов
+8. LED-лента — короткая тестовая последовательность цветов
    (`led_interface.set_led`); безопасна без пропеллеров.
-8. Захват груза — ТОЛЬКО если передан ``--test-gripper`` (двигает
+9. Захват груза — ТОЛЬКО если передан ``--test-gripper`` (двигает
    сервопривод, поэтому по умолчанию выключено).
-9. Двигатели — ТОЛЬКО если передан ``--test-motors``: краткое арм/дизарм
-   БЕЗ navigate()/взлёта (двигатели кратко включатся — пропеллеры должны
-   быть сняты, если проверка не на воздухе).
-10. Полёт (взлёт/метки/посадка) — ТОЛЬКО если передан ``--test-flight``:
+10. Двигатели — ТОЛЬКО если передан ``--test-motors``: краткое арм/дизарм
+    БЕЗ navigate()/взлёта (двигатели кратко включатся — пропеллеры должны
+    быть сняты, если проверка не на воздухе).
+11. Полёт (взлёт/метки/посадка) — ТОЛЬКО если передан ``--test-flight``:
     настоящий взлёт на ``--flight-check-altitude`` (по умолчанию 1 м),
     подтверждение видимости меток на высоте (`flight_core.
     wait_for_markers_visible`) и штатная посадка. Требует расчищенной
@@ -54,11 +61,12 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 import flight_core as fc
+import flight_nav as nav
 import led_interface as led
 
 
@@ -137,6 +145,7 @@ def run_diagnosis(
     rangefinder_timeout: float = 2.0,
     markers_timeout: float = 2.0,
     camera_timeout: float = 2.0,
+    max_marker_distance: float = 2.5,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> List[CheckResult]:
     """Прогнать все проверки и вернуть список результатов.
@@ -147,10 +156,13 @@ def run_diagnosis(
     """
     results: List[CheckResult] = []
 
+    map_box: List[Dict[int, Tuple[float, float, float]]] = []
+
     def _check_field_map() -> str:
         markers = fc.read_map(map_path)
         if not markers:
             raise ValueError("карта поля пуста")
+        map_box.append(markers)
         return "меток в карте: {}".format(len(markers))
 
     results.append(_run_check("Карта поля ({})".format(map_path), _check_field_map))
@@ -181,6 +193,30 @@ def run_diagnosis(
         return "видно меток: {} (ID: {})".format(len(marker_ids), list(marker_ids))
 
     results.append(_run_check("Видимость меток (aruco_detect/markers)", _check_markers_visible))
+
+    def _check_localization_consistency() -> str:
+        # Проверки выше отвечают на вопросы «есть ли позиция» и «видно ли
+        # метки» по отдельности. Эта — на главный: соответствует ли позиция
+        # тому, что камера реально видит. Если нет, лететь по aruco_map
+        # нельзя ни в каком режиме (см. flight_nav.read_localization).
+        if not map_box:
+            raise RuntimeError("карта поля не прочитана — см. первую проверку")
+        status = nav.read_localization(
+            get_telemetry,
+            marker_id_reader,
+            map_box[0],
+            max_marker_distance=max_marker_distance,
+            read_timeout=markers_timeout,
+        )
+        if not status.ok:
+            raise RuntimeError(status.reason)
+        return "позиция ({:.2f}, {:.2f}) согласована с меткой {} (расхождение {:.2f} м)".format(
+            status.x, status.y, status.nearest_id, status.marker_distance
+        )
+
+    results.append(
+        _run_check("Согласованность aruco_map с метками", _check_localization_consistency)
+    )
 
     def _check_rangefinder() -> str:
         distance = rangefinder_reader(rangefinder_timeout)
@@ -314,12 +350,17 @@ def _self_test() -> int:
     import flight_test_support as fts
 
     telemetry = fts.FakeTelemetry(x=2.0, y=5.0, z=0.0, armed=False)
+    # Метки, которые камера реально видела бы из точки (2, 5) по карте поля:
+    # соседи метки 37 в решётке 7x7. Проверка «Согласованность aruco_map с
+    # метками» сверяет именно это, поэтому произвольный набор ID в заглушке
+    # (например, верхний ряд 1..6) для неё был бы аварийной ситуацией.
+    VISIBLE_AROUND_START = (29, 30, 31, 36, 37, 38)
     led_calls, _led_backend = fts.record_led_calls()
 
     results = run_diagnosis(
         map_path="config/field_map.txt",
         get_telemetry=lambda **_kwargs: telemetry,
-        marker_id_reader=lambda _timeout: (1, 2, 3, 4, 5, 6),
+        marker_id_reader=lambda _timeout: VISIBLE_AROUND_START,
         rangefinder_reader=lambda _timeout: 0.85,
         set_led_fn=led.set_led,
         sleep_fn=lambda _duration: None,
@@ -330,6 +371,7 @@ def _self_test() -> int:
     assert by_name["Локализация по aruco_map"].ok is True
     assert by_name["Видимость меток (aruco_detect/markers)"].ok is True
     assert "видно меток: 6" in by_name["Видимость меток (aruco_detect/markers)"].detail
+    assert by_name["Согласованность aruco_map с метками"].ok is True
     assert by_name["Дальномер (/rangefinder/range)"].ok is True
     assert by_name["LED-лента"].ok is True
     assert ("solid", (0, 0, 0)) == led_calls[-1] or ("fill", (0, 0, 0)) == led_calls[-1]
@@ -346,13 +388,31 @@ def _self_test() -> int:
     )
     by_name_no_markers = {result.name: result for result in results_no_markers}
     assert by_name_no_markers["Видимость меток (aruco_detect/markers)"].ok is False
+    assert by_name_no_markers["Согласованность aruco_map с метками"].ok is False
     assert by_name_no_markers["Дальномер (/rangefinder/range)"].ok is True
+
+    # Главный диагностируемый случай: и позиция есть, и метки видны, но
+    # позиция им противоречит (aruco_map «уверенно врёт»). Обе прежние
+    # проверки при этом зелёные — именно поэтому нужна отдельная.
+    results_lying = run_diagnosis(
+        map_path="config/field_map.txt",
+        get_telemetry=lambda **_kwargs: telemetry,  # карта считает, что дрон в (2, 5)
+        marker_id_reader=lambda _timeout: (0, 1, 7),  # а камера видит угол поля
+        rangefinder_reader=lambda _timeout: 0.85,
+        set_led_fn=led.set_led,
+        sleep_fn=lambda _duration: None,
+    )
+    by_name_lying = {result.name: result for result in results_lying}
+    assert by_name_lying["Локализация по aruco_map"].ok is True
+    assert by_name_lying["Видимость меток (aruco_detect/markers)"].ok is True
+    assert by_name_lying["Согласованность aruco_map с метками"].ok is False
+    assert "расходится" in by_name_lying["Согласованность aruco_map с метками"].detail
 
     # Некорректный путь к карте -> FAIL только по этой проверке
     results_bad_map = run_diagnosis(
         map_path="does-not-exist.txt",
         get_telemetry=lambda **_kwargs: telemetry,
-        marker_id_reader=lambda _timeout: (1, 2, 3, 4, 5, 6),
+        marker_id_reader=lambda _timeout: VISIBLE_AROUND_START,
         rangefinder_reader=lambda _timeout: 0.85,
         set_led_fn=led.set_led,
         sleep_fn=lambda _duration: None,
@@ -376,7 +436,7 @@ def _self_test() -> int:
     results_with_camera = run_diagnosis(
         map_path="config/field_map.txt",
         get_telemetry=lambda **_kwargs: telemetry,
-        marker_id_reader=lambda _timeout: (1, 2, 3, 4, 5, 6),
+        marker_id_reader=lambda _timeout: VISIBLE_AROUND_START,
         rangefinder_reader=lambda _timeout: 0.85,
         set_led_fn=led.set_led,
         image_reader=lambda _timeout: FakeFrame(),
@@ -394,7 +454,7 @@ def _self_test() -> int:
     results_with_gripper = run_diagnosis(
         map_path="config/field_map.txt",
         get_telemetry=lambda **_kwargs: telemetry,
-        marker_id_reader=lambda _timeout: (1, 2, 3, 4, 5, 6),
+        marker_id_reader=lambda _timeout: VISIBLE_AROUND_START,
         rangefinder_reader=lambda _timeout: 0.85,
         set_led_fn=led.set_led,
         gripper_actions=(
@@ -434,7 +494,7 @@ def _self_test() -> int:
     results_with_flight = run_diagnosis(
         map_path="config/field_map.txt",
         get_telemetry=_fake_flight_telemetry,
-        marker_id_reader=lambda _timeout: (1, 2, 3, 4, 5, 6),
+        marker_id_reader=lambda _timeout: VISIBLE_AROUND_START,
         rangefinder_reader=lambda _timeout: 0.85,
         set_led_fn=led.set_led,
         motor_check=MotorCheckActions(arming=_fake_arming, arm_hold_s=0.0),
@@ -471,6 +531,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rangefinder-timeout", type=float, default=2.0)
     parser.add_argument("--markers-timeout", type=float, default=2.0)
     parser.add_argument("--camera-timeout", type=float, default=2.0)
+    parser.add_argument(
+        "--max-marker-distance",
+        type=float,
+        default=2.5,
+        help="насколько далеко позиция aruco_map может отстоять от видимой "
+        "метки, прежде чем локализация считается недостоверной, м "
+        "(тот же порог, что у bvs1_flight.py)",
+    )
     parser.add_argument(
         "--skip-camera",
         action="store_true",
@@ -567,6 +635,7 @@ def main() -> int:
             rangefinder_timeout=args.rangefinder_timeout,
             markers_timeout=args.markers_timeout,
             camera_timeout=args.camera_timeout,
+            max_marker_distance=args.max_marker_distance,
         )
     finally:
         led.close_led_backend()

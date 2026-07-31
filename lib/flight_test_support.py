@@ -12,8 +12,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import flight_core as fc
 import led_interface as led
@@ -25,6 +26,10 @@ class FakeTelemetry:
     y: float
     z: float
     armed: bool
+    # Курс дрона в запрошенном фрейме - нужен flight_nav для пересчёта
+    # смещения из aruco_map в body (режим перелёта 'relative'). FakeFlight
+    # курс не меняет: заглушка «телепортирует» дрон, не имитируя динамику.
+    yaw: float = 0.0
 
 
 class FakeClock:
@@ -48,6 +53,11 @@ class FakeFlight:
     ``navigate()`` мгновенно "телепортирует" дрон в целевую точку и переводит
     его в armed=True (как настоящий взлёт/перелёт), не имитируя физику
     полёта — самотесты проверяют порядок вызовов и параметры, а не динамику.
+
+    ``frame_id='body'`` при этом трактуется как **приращение** к текущему
+    положению (с учётом курса), а не как абсолютная точка: иначе взлёт
+    ``navigate(0, 0, z, frame_id='body')`` «переносил» бы заглушку в начало
+    координат поля, и любая проверка позиции после взлёта проверяла бы не то.
     """
 
     def __init__(self, start_x: float, start_y: float, start_z: float = 0.0) -> None:
@@ -55,9 +65,9 @@ class FakeFlight:
             "x": start_x,
             "y": start_y,
             "z": start_z,
+            "yaw": 0.0,
             "armed": False,
         }
-        self._last_target: Tuple[float, float, float] = (start_x, start_y, start_z)
         self.navigate_calls: List[Dict[str, Any]] = []
         self.disarm_calls: List[bool] = []
         self.proxies = fc.FlightProxies(
@@ -76,28 +86,32 @@ class FakeFlight:
         speed: float,
         frame_id: str,
         auto_arm: bool = False,
+        yaw: float = 0.0,
     ) -> None:
         self.navigate_calls.append(
             {"x": x, "y": y, "z": z, "frame_id": frame_id, "auto_arm": auto_arm}
         )
-        self.state["x"], self.state["y"], self.state["z"] = x, y, z
+        if frame_id == "body":
+            drone_yaw = self.state["yaw"]
+            self.state["x"] += x * math.cos(drone_yaw) - y * math.sin(drone_yaw)
+            self.state["y"] += x * math.sin(drone_yaw) + y * math.cos(drone_yaw)
+            self.state["z"] += z
+        else:
+            self.state["x"], self.state["y"], self.state["z"] = x, y, z
         self.state["armed"] = True
-        self._last_target = (x, y, z)
 
     def _get_telemetry(self, *, frame_id: str = "aruco_map", **_kwargs: object) -> FakeTelemetry:
         if frame_id == "navigate_target":
             # "телепорт" в _navigate() мгновенный, поэтому дрон уже в цели -
             # остаток пути в этом фрейме всегда (0, 0, 0), как и должно быть
             # у реального navigate_target сразу после прибытия.
-            tx, ty, tz = self._last_target
-            return FakeTelemetry(
-                self.state["x"] - tx,
-                self.state["y"] - ty,
-                self.state["z"] - tz,
-                self.state["armed"],
-            )
+            return FakeTelemetry(0.0, 0.0, 0.0, self.state["armed"])
         return FakeTelemetry(
-            self.state["x"], self.state["y"], self.state["z"], self.state["armed"]
+            self.state["x"],
+            self.state["y"],
+            self.state["z"],
+            self.state["armed"],
+            self.state["yaw"],
         )
 
     def _land(self) -> None:
@@ -123,6 +137,37 @@ def fixed_marker_reader(*marker_ids: int) -> Any:
 
     def _reader(_timeout: float) -> Tuple[int, ...]:
         return tuple(marker_ids)
+
+    return _reader
+
+
+def visible_marker_reader(
+    flight: FakeFlight,
+    markers: Dict[int, Tuple[float, float, float]],
+    *,
+    radius: float = 1.5,
+) -> Callable[[float], Tuple[int, ...]]:
+    """Заглушка ``marker_id_reader``, привязанная к позиции дрона: «видны»
+    метки в радиусе ``radius`` от неё (если ни одной — ближайшая).
+
+    В отличие от ``fixed_marker_reader`` подходит для проверок
+    согласованности позиции с тем, что реально видит камера
+    (``flight_nav.read_localization``): камера смотрит вниз, поэтому далёкая
+    метка в кадре — признак того, что локализация врёт, и заглушка должна
+    вести себя так же, иначе самотест «пролетал» бы аварийные сценарии.
+    """
+
+    def _reader(_timeout: float) -> Tuple[int, ...]:
+        x, y = flight.state["x"], flight.state["y"]
+
+        def _distance(marker_id: int) -> float:
+            mx, my, _mz = markers[marker_id]
+            return math.hypot(mx - x, my - y)
+
+        visible = tuple(sorted(mid for mid in markers if _distance(mid) <= radius))
+        if visible:
+            return visible
+        return (min(markers, key=_distance),)
 
     return _reader
 
