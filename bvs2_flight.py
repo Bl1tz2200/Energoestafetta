@@ -91,10 +91,10 @@ class MissionConfig:
     gripper_pin: int = 17
     gripper_open_pulse: int = 1000
     gripper_close_pulse: int = 2000
-    # По просьбе пользователя (см. bvs1_flight.py) — 30с вместо честных
-    # 15с/5с зарядки, чтобы тестовые попытки шли быстрее. Для зачётной
-    # попытки заменить на реальный тайминг регламента.
-    charge_wait_total_s: float = 30.0
+    # Реальный тайминг регламента (Табл.1), см. bvs1_flight.py: 15с красная
+    # мигающая + 5с зелёная перед взлётом. Переопределяется через
+    # --charge-wait для тестовых попыток, если нужно ускорить итерацию.
+    charge_wait_total_s: float = 15.0
     charge_green_before_takeoff_s: float = 5.0
     node_name: str = "bvs2_flight"
 
@@ -116,16 +116,28 @@ def run_mission(
     cargo_x, cargo_y = fc.marker_xy(markers, config.cargo_marker_id)
     station_x, station_y = fc.marker_xy(markers, config.station_marker_id)
 
-    # 1. Взлёт с исходной точки — жёлтый мигающий (Табл.1 регламента)
+    # 0. Гарантируем, что захват открыт до подлёта к грузу — после
+    # предыдущей попытки или диагностики сервопривод мог остаться закрытым,
+    # а первой аппаратной командой не должна быть close() над самим грузом.
+    gripper_proxy.open()
+
+    # 1. Взлёт с исходной точки — жёлтый мигающий (Табл.1 регламента).
+    # frame_id='body' (не 'aruco_map'): сразу после включения aruco_map ещё
+    # может быть не готов (TF появляется только после того, как дрон увидел
+    # метки поля), поэтому первый взлёт — вертикальный подъём в собственной
+    # системе координат дрона, как в примере TASK.md/CodeExamples.html
+    # (navigate(x=0, y=0, z=1.5, frame_id='body', auto_arm=True)). Дрон уже
+    # стоит над start_marker_id, так что боковое смещение не нужно — карта
+    # поля используется начиная со следующего шага.
     led.set_led("blink", "yellow")
     fc.navigate_wait(
         proxies.navigate,
         proxies.get_telemetry,
-        x=start_x,
-        y=start_y,
+        x=0.0,
+        y=0.0,
         z=config.cruise_altitude_m,
         speed=config.approach_speed,
-        frame_id="aruco_map",
+        frame_id="body",
         auto_arm=True,
         tolerance=config.navigate_tolerance_m,
         timeout=config.navigate_timeout_s,
@@ -225,7 +237,7 @@ def run_mission(
         time_fn=time_fn,
     )
     min_z = config.station_height_m + config.landing_safety_margin_m
-    fc.controlled_descent_and_disarm(
+    descent = fc.controlled_descent_and_disarm(
         proxies.navigate,
         proxies.arming,
         rangefinder_reader,
@@ -239,6 +251,16 @@ def run_mission(
         frame_id="aruco_map",
         sleep_fn=sleep_fn,
     )
+    if not descent.touchdown_detected:
+        # Дизарм в controlled_descent_and_disarm уже произошёл (по safety-
+        # высоте min_z, не по факту касания) — но продолжать миссию вслепую
+        # (сброс груза, повторный взлёт) на неподтверждённой посадке нельзя.
+        raise RuntimeError(
+            "Касание станции не подтверждено дальномером (last_range={}); "
+            "дизарм выполнен по safety-высоте {:.2f} м".format(
+                descent.last_range, descent.final_z
+            )
+        )
 
     # 7. Имитация зарядки: заглушка вместо честных 15с/5с (Табл.1) — общая
     # длительность конфигурируется, соотношение «зелёный за N секунд до
@@ -338,10 +360,14 @@ def _self_test() -> int:
         time_fn=clock.time,
     )
 
+    # Захват открыт заранее, до подлёта к грузу (защита от предыдущего
+    # состояния сервопривода)
+    assert gripper_calls[0] == "open"
+
     # Взлёт со старта
-    assert navigate_calls[0]["x"] == 6.0 and navigate_calls[0]["y"] == 2.0
+    assert navigate_calls[0]["x"] == 0.0 and navigate_calls[0]["y"] == 0.0
     assert navigate_calls[0]["auto_arm"] is True
-    assert navigate_calls[0]["frame_id"] == "aruco_map"
+    assert navigate_calls[0]["frame_id"] == "body"  # взлёт: TF aruco_map ещё может быть не готов
 
     # Полёт к грузу на крейсерской высоте
     assert navigate_calls[1]["x"] == 3.0 and navigate_calls[1]["y"] == 0.0
@@ -353,7 +379,7 @@ def _self_test() -> int:
     assert navigate_calls[2]["z"] == 0.3
 
     # Захват груза произошёл между снижением и подъёмом обратно
-    assert gripper_calls[0] == "close"
+    assert gripper_calls[1] == "close"
 
     # Подъём обратно над грузом
     assert navigate_calls[3]["x"] == 3.0 and navigate_calls[3]["z"] == 1.5
@@ -366,7 +392,7 @@ def _self_test() -> int:
     assert disarm_calls == [False]
 
     # Сброс груза произошёл после зарядки, до повторного взлёта
-    assert gripper_calls == ["close", "open"]
+    assert gripper_calls == ["open", "close", "open"]
 
     # Повторный взлёт со станции и возврат на старт
     assert navigate_calls[-2]["x"] == 5.0 and navigate_calls[-2]["y"] == 0.0
@@ -378,9 +404,35 @@ def _self_test() -> int:
     patterns = [entry for entry in recorded_leds if entry[0] in ("fill", "blink", "rainbow")]
     assert patterns[0] == ("blink", (255, 255, 0))  # взлёт / полёт к грузу
     assert patterns[1] == ("fill", (255, 0, 0))  # захват груза
-    assert patterns[2] == ("blink", (255, 0, 0))  # имитация зарядки
-    assert patterns[3] == ("blink", (0, 255, 0))  # зелёный перед взлётом
+    assert patterns[2] == ("blink", (255, 0, 0))  # имитация зарядки (красная фаза)
+    assert patterns[3] == ("fill", (0, 255, 0))  # зелёная лента перед взлётом (не мигающая — TASK.md)
     assert patterns[4] == ("blink", (0, 255, 0))  # возврат
+
+    # Если дальномер так и не подтвердит касание станции, миссия должна
+    # остановиться явной ошибкой, а не продолжить сброс груза/взлёт вслепую.
+    def never_touchdown_rangefinder(_timeout: float) -> float:
+        return 5.0
+
+    flight_no_touchdown = fts.FakeFlight(start_x=6.0, start_y=2.0)
+    gripper_proxy_no_touchdown = GripperProxy(
+        open=lambda: None,
+        close=lambda: None,
+    )
+    clock_no_touchdown = fts.FakeClock()
+    try:
+        run_mission(
+            flight_no_touchdown.proxies,
+            gripper_proxy_no_touchdown,
+            markers,
+            config,
+            rangefinder_reader=never_touchdown_rangefinder,
+            sleep_fn=clock_no_touchdown.sleep,
+            time_fn=clock_no_touchdown.time,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Ожидался RuntimeError при неподтверждённом касании")
 
     print("SELF-TEST: OK")
     return 0

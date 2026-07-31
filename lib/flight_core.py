@@ -322,8 +322,10 @@ def simulate_charging(
     green_before_takeoff_s: float,
     sleep_fn: Callable[[float], None] = sleep,
 ) -> None:
-    """Имитация зарядки по Табл.1: красная мигающая лента, а за
-    ``green_before_takeoff_s`` секунд до взлёта — зелёная мигающая.
+    """Имитация зарядки по TASK.md (алгоритм, шаги 3 и 6): красная мигающая
+    лента, а за ``green_before_takeoff_s`` секунд до взлёта — зелёная лента
+    (не мигающая — TASK.md называет её "зелёная лента" в отличие от явно
+    "зелёного мигающего" сигнала возврата на старт).
 
     Общая для ``bvs1_flight.py`` и ``bvs2_flight.py`` (шаг «имитация
     зарядки» в обоих сценариях делает ровно это), поэтому вынесена сюда, а
@@ -340,7 +342,7 @@ def simulate_charging(
     hold_s = total_s - green_before_takeoff_s
     if hold_s > 0:
         sleep_fn(hold_s)
-    set_led_fn("blink", "green")
+    set_led_fn("solid", "green")
     sleep_fn(green_before_takeoff_s)
 
 
@@ -550,7 +552,7 @@ def _self_test() -> int:
         green_before_takeoff_s=5.0,
         sleep_fn=recording_sleep,
     )
-    assert led_calls == [("blink", "red"), ("blink", "green")]
+    assert led_calls == [("blink", "red"), ("solid", "green")]
     assert sleep_calls == [10.0, 5.0]
 
     # simulate_charging: green_before_takeoff_s >= total_s -> без красной фазы
@@ -562,7 +564,7 @@ def _self_test() -> int:
         green_before_takeoff_s=5.0,
         sleep_fn=recording_sleep,
     )
-    assert led_calls == [("blink", "red"), ("blink", "green")]
+    assert led_calls == [("blink", "red"), ("solid", "green")]
     assert sleep_calls == [5.0]  # красная фаза пропущена (hold_s <= 0)
 
     print("SELF-TEST: OK")
