@@ -114,6 +114,19 @@ def instant_touchdown_rangefinder(_timeout: float) -> float:
     return 0.05
 
 
+def fixed_marker_reader(*marker_ids: int) -> Any:
+    """Заглушка ``marker_id_reader`` — камера "всегда видит" ровно эти ID.
+
+    Имитирует реальную сцену «дрон после взлёта видит метку под собой»,
+    не поднимая ROS 1/камеру — используется вместо
+    ``flight_core.read_visible_marker_ids_ros`` в самотестах."""
+
+    def _reader(_timeout: float) -> Tuple[int, ...]:
+        return tuple(marker_ids)
+
+    return _reader
+
+
 def record_led_calls() -> Tuple[List[Tuple[str, Any]], led.LEDBackend]:
     """Подключить LED backend, который просто запоминает вызовы, и вернуть
     список записей вместе с самим backend."""

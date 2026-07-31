@@ -47,7 +47,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from time import sleep
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
@@ -87,6 +87,10 @@ class MissionConfig:
     stabilize_timeout_s: float = 10.0
     navigate_tolerance_m: float = 0.2
     navigate_timeout_s: float = 30.0
+    # Сколько ждать после взлёта, пока камера не увидит хоть одну метку поля
+    # (см. flight_core.wait_for_markers_visible) - до этого aruco_map
+    # недостоверен, лететь по нему нельзя.
+    markers_visible_timeout_s: float = 10.0
     gripper_close_delay_s: float = 0.5
     gripper_pin: int = 17
     gripper_open_pulse: int = 1000
@@ -106,8 +110,10 @@ def run_mission(
     config: MissionConfig,
     *,
     rangefinder_reader: Callable[[float], float] = fc.read_rangefinder_ros,
+    marker_id_reader: Callable[[float], Sequence[int]] = fc.read_visible_marker_ids_ros,
     sleep_fn: Callable[[float], None] = sleep,
     time_fn: Callable[[], float] = time.monotonic,
+    verbose: bool = False,
 ) -> None:
     """Выполнить полную миссию БВС-2. Не зависит от rospy/gripper_control
     напрямую — все внешние вызовы приходят через ``proxies``/``gripper_proxy``,
@@ -129,6 +135,8 @@ def run_mission(
     # (navigate(x=0, y=0, z=1.5, frame_id='body', auto_arm=True)). Дрон уже
     # стоит над start_marker_id, так что боковое смещение не нужно — карта
     # поля используется начиная со следующего шага.
+    if verbose:
+        print("[run_mission] === Шаг 1: взлёт (frame_id=body) ===")
     led.set_led("blink", "yellow")
     fc.navigate_wait(
         proxies.navigate,
@@ -143,15 +151,44 @@ def run_mission(
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
 
-    # 2. Полёт в зону захвата груза — индикация не меняется, жёлтый
-    # мигающий по тексту алгоритма покрывает и взлёт, и полёт к грузу.
+    # 2. Подтверждение локализации по реально видимым меткам: сразу после
+    # взлёта aruco_map может быть ещё недостоверен - см. подробное объяснение
+    # и историю аварии на площадке в docstring
+    # flight_core.wait_for_markers_visible/bvs1_flight.run_mission. Стартовая
+    # метка БВС-2 случайна и объявляется перед попыткой, а дрон на ней может
+    # стоять повёрнутым по yaw в любую сторону - привязка идёт по факту
+    # видимых меток и их известным координатам из карты, а не по тому, куда
+    # "смотрит" дрон, поэтому ориентация на старте роли не играет.
+    if verbose:
+        print("[run_mission] === Шаг 2: подтверждение локализации по видимым меткам ===")
+    visible_marker_ids = fc.wait_for_markers_visible(
+        marker_id_reader,
+        timeout=config.markers_visible_timeout_s,
+        sleep_fn=sleep_fn,
+        time_fn=time_fn,
+        verbose=verbose,
+    )
+    print("[run_mission] видимые метки поля после взлёта: {}".format(list(visible_marker_ids)))
+
+    telemetry_now = proxies.get_telemetry(frame_id="aruco_map")
+    anchor_marker_id = fc.nearest_marker_id(
+        markers, visible_marker_ids, telemetry_now.x, telemetry_now.y
+    )
+    anchor_x, anchor_y = fc.marker_xy(markers, anchor_marker_id)
+    if verbose:
+        print(
+            "[run_mission] привязка к метке {} ({:.2f}, {:.2f})".format(
+                anchor_marker_id, anchor_x, anchor_y
+            )
+        )
     fc.navigate_wait(
         proxies.navigate,
         proxies.get_telemetry,
-        x=cargo_x,
-        y=cargo_y,
+        x=anchor_x,
+        y=anchor_y,
         z=config.cruise_altitude_m,
         speed=config.approach_speed,
         frame_id="aruco_map",
@@ -159,9 +196,52 @@ def run_mission(
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
+    )
+    fc.wait_until_stable(
+        proxies.get_telemetry,
+        x=anchor_x,
+        y=anchor_y,
+        frame_id="aruco_map",
+        tolerance=config.stabilize_tolerance_m,
+        hold_time=config.stabilize_hold_s,
+        timeout=config.stabilize_timeout_s,
+        sleep_fn=sleep_fn,
+        time_fn=time_fn,
+        verbose=verbose,
     )
 
-    # 3. Стабилизация над грузом перед снижением
+    # 3. Полёт в зону захвата груза поочерёдно по меткам сетки, не
+    # перепрыгивая их (flight_core.marker_path) — индикация не меняется,
+    # жёлтый мигающий по тексту алгоритма покрывает и взлёт, и полёт к грузу.
+    # Дрон крупный, поэтому каждый перегон летит на пониженной скорости
+    # (descent_speed, не approach_speed) и завершается стабилизацией
+    # (flight_core.fly_marker_path) - без резких перемещений между метками.
+    if verbose:
+        print("[run_mission] === Шаг 3: подлёт к грузу по меткам сетки (frame_id=aruco_map) ===")
+    cargo_path = fc.marker_path(markers, anchor_marker_id, config.cargo_marker_id)
+    if verbose:
+        print("[run_mission] путь по меткам до груза: {}".format(list(cargo_path)))
+    fc.fly_marker_path(
+        proxies.navigate,
+        proxies.get_telemetry,
+        markers,
+        cargo_path,
+        z=config.cruise_altitude_m,
+        speed=config.descent_speed,
+        navigate_tolerance=config.navigate_tolerance_m,
+        navigate_timeout=config.navigate_timeout_s,
+        stabilize_tolerance=config.stabilize_tolerance_m,
+        stabilize_hold=config.stabilize_hold_s,
+        stabilize_timeout=config.stabilize_timeout_s,
+        sleep_fn=sleep_fn,
+        time_fn=time_fn,
+        verbose=verbose,
+    )
+
+    # 4. Стабилизация над грузом перед снижением
+    if verbose:
+        print("[run_mission] === Шаг 4: стабилизация над грузом ===")
     fc.wait_until_stable(
         proxies.get_telemetry,
         x=cargo_x,
@@ -172,10 +252,13 @@ def run_mission(
         timeout=config.stabilize_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
 
-    # 4. Захват груза — красная лента, зависание на заданной высоте (груз на
+    # 5. Захват груза — красная лента, зависание на заданной высоте (груз на
     # полу, не на кубе — дальномер/дизарм не нужны), затем захват и подъём.
+    if verbose:
+        print("[run_mission] === Шаг 5: захват груза ===")
     led.set_led("solid", "red")
     fc.navigate_wait(
         proxies.navigate,
@@ -189,6 +272,7 @@ def run_mission(
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
     gripper_proxy.close()
     if config.gripper_close_delay_s > 0:
@@ -205,26 +289,38 @@ def run_mission(
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
 
-    # 5. Полёт к собственной зарядной станции БВС-2 с грузом — индикация не
-    # меняется (красная лента, по тексту шага 5 алгоритма).
-    fc.navigate_wait(
-        proxies.navigate,
-        proxies.get_telemetry,
-        x=station_x,
-        y=station_y,
-        z=config.cruise_altitude_m,
-        speed=config.approach_speed,
-        frame_id="aruco_map",
-        tolerance=config.navigate_tolerance_m,
-        timeout=config.navigate_timeout_s,
-        sleep_fn=sleep_fn,
-        time_fn=time_fn,
-    )
+    # 6. Полёт к собственной зарядной станции БВС-2 с грузом поочерёдно по
+    # меткам сетки, не перепрыгивая их — индикация не меняется (красная
+    # лента, по тексту шага 5 алгоритма).
+    if verbose:
+        print("[run_mission] === Шаг 6: подлёт к станции по меткам сетки (frame_id=aruco_map) ===")
+    station_path = fc.marker_path(markers, config.cargo_marker_id, config.station_marker_id)
+    if verbose:
+        print("[run_mission] путь по меткам до станции: {}".format(list(station_path)))
+    for marker_id in station_path[1:]:
+        leg_x, leg_y = fc.marker_xy(markers, marker_id)
+        fc.navigate_wait(
+            proxies.navigate,
+            proxies.get_telemetry,
+            x=leg_x,
+            y=leg_y,
+            z=config.cruise_altitude_m,
+            speed=config.approach_speed,
+            frame_id="aruco_map",
+            tolerance=config.navigate_tolerance_m,
+            timeout=config.navigate_timeout_s,
+            sleep_fn=sleep_fn,
+            time_fn=time_fn,
+            verbose=verbose,
+        )
 
-    # 6. Стабилизация и управляемый спуск на куб станции + ручной дизарм по
+    # 7. Стабилизация и управляемый спуск на куб станции + ручной дизарм по
     # дальномеру (не полагаемся на land() — см. bvs1_flight.py/TASK.md)
+    if verbose:
+        print("[run_mission] === Шаг 7: стабилизация и спуск на станцию ===")
     fc.wait_until_stable(
         proxies.get_telemetry,
         x=station_x,
@@ -235,6 +331,7 @@ def run_mission(
         timeout=config.stabilize_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
     min_z = config.station_height_m + config.landing_safety_margin_m
     descent = fc.controlled_descent_and_disarm(
@@ -250,6 +347,7 @@ def run_mission(
         speed=config.descent_speed,
         frame_id="aruco_map",
         sleep_fn=sleep_fn,
+        verbose=verbose,
     )
     if not descent.touchdown_detected:
         # Дизарм в controlled_descent_and_disarm уже произошёл (по safety-
@@ -262,9 +360,11 @@ def run_mission(
             )
         )
 
-    # 7. Имитация зарядки: заглушка вместо честных 15с/5с (Табл.1) — общая
+    # 8. Имитация зарядки: заглушка вместо честных 15с/5с (Табл.1) — общая
     # длительность конфигурируется, соотношение «зелёный за N секунд до
     # взлёта» сохранено (см. bvs1_flight.py/flight_core.simulate_charging).
+    if verbose:
+        print("[run_mission] === Шаг 8: имитация зарядки ===")
     fc.simulate_charging(
         led.set_led,
         total_s=config.charge_wait_total_s,
@@ -272,11 +372,15 @@ def run_mission(
         sleep_fn=sleep_fn,
     )
 
-    # 8. Сброс груза — после имитации зарядки, перед повторным взлётом
+    # 9. Сброс груза — после имитации зарядки, перед повторным взлётом
     # (порядок из текста шага 6 алгоритма).
+    if verbose:
+        print("[run_mission] === Шаг 9: сброс груза ===")
     gripper_proxy.open()
 
-    # 9. Повторный взлёт с куба станции до крейсерской высоты
+    # 10. Повторный взлёт с куба станции до крейсерской высоты
+    if verbose:
+        print("[run_mission] === Шаг 10: повторный взлёт с куба ===")
     fc.navigate_wait(
         proxies.navigate,
         proxies.get_telemetry,
@@ -290,31 +394,47 @@ def run_mission(
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
 
-    # 10. Возврат на исходную позицию — зелёный мигающий
+    # 11. Возврат на исходную позицию поочерёдно по меткам сетки — зелёный
+    # мигающий (та же логика "не перепрыгивать метки", что и на пути к
+    # станции в шаге 6).
+    if verbose:
+        print("[run_mission] === Шаг 11: возврат на старт по меткам сетки ===")
     led.set_led("blink", "green")
-    fc.navigate_wait(
-        proxies.navigate,
-        proxies.get_telemetry,
-        x=start_x,
-        y=start_y,
-        z=config.cruise_altitude_m,
-        speed=config.approach_speed,
-        frame_id="aruco_map",
-        tolerance=config.navigate_tolerance_m,
-        timeout=config.navigate_timeout_s,
-        sleep_fn=sleep_fn,
-        time_fn=time_fn,
-    )
+    return_path = fc.marker_path(markers, config.station_marker_id, config.start_marker_id)
+    if verbose:
+        print("[run_mission] путь по меткам на старт: {}".format(list(return_path)))
+    for marker_id in return_path[1:]:
+        leg_x, leg_y = fc.marker_xy(markers, marker_id)
+        fc.navigate_wait(
+            proxies.navigate,
+            proxies.get_telemetry,
+            x=leg_x,
+            y=leg_y,
+            z=config.cruise_altitude_m,
+            speed=config.approach_speed,
+            frame_id="aruco_map",
+            tolerance=config.navigate_tolerance_m,
+            timeout=config.navigate_timeout_s,
+            sleep_fn=sleep_fn,
+            time_fn=time_fn,
+            verbose=verbose,
+        )
 
-    # 11. Штатная посадка — под стартовой меткой ровный пол, куба нет
+    # 12. Штатная посадка — под стартовой меткой ровный пол, куба нет
+    if verbose:
+        print("[run_mission] === Шаг 12: посадка на старте ===")
     fc.land_wait(
         proxies.land,
         proxies.get_telemetry,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
+    if verbose:
+        print("[run_mission] === Миссия завершена ===")
 
 
 def _self_test() -> int:
@@ -322,7 +442,10 @@ def _self_test() -> int:
 
     recorded_leds, _led_backend = fts.record_led_calls()
 
-    markers = {0: (3.0, 0.0, 0.0), 5: (5.0, 0.0, 0.0), 20: (6.0, 2.0, 0.0)}
+    # Полная карта поля 7x7 (не три точки) - нужна, чтобы marker_path() мог
+    # растеризовать путь по промежуточным меткам решётки между стартом,
+    # грузом и станцией, а не только знать сами эти три точки.
+    markers = fc.read_map("config/field_map.txt")
 
     flight = fts.FakeFlight(start_x=6.0, start_y=2.0)
     navigate_calls = flight.navigate_calls
@@ -350,12 +473,16 @@ def _self_test() -> int:
         charge_green_before_takeoff_s=0.1,
     )
 
+    # Камера "видит" ровно стартовую метку 20 сразу после взлёта - этого
+    # достаточно, чтобы подтвердить локализацию (см. flight_core.
+    # wait_for_markers_visible/nearest_marker_id) без реального ROS 1.
     run_mission(
         flight.proxies,
         gripper_proxy,
         markers,
         config,
         rangefinder_reader=fts.instant_touchdown_rangefinder,
+        marker_id_reader=fts.fixed_marker_reader(20),
         sleep_fn=clock.sleep,
         time_fn=clock.time,
     )
@@ -369,24 +496,32 @@ def _self_test() -> int:
     assert navigate_calls[0]["auto_arm"] is True
     assert navigate_calls[0]["frame_id"] == "body"  # взлёт: TF aruco_map ещё может быть не готов
 
-    # Полёт к грузу на крейсерской высоте
-    assert navigate_calls[1]["x"] == 3.0 and navigate_calls[1]["y"] == 0.0
-    assert navigate_calls[1]["z"] == 1.5
+    # Привязка локализации к видимой стартовой метке (20, (6, 2))
+    assert navigate_calls[1]["x"] == 6.0 and navigate_calls[1]["y"] == 2.0
     assert navigate_calls[1]["auto_arm"] is False
 
+    # Путь до груза идёт по соседним узлам решётки поля (20 -> 19 -> 11 ->
+    # 10 -> 9 -> 1 -> 0), не перепрыгивая метки одним диагональным прыжком.
+    cargo_leg_xy = [(call["x"], call["y"]) for call in navigate_calls[1:8]]
+    assert cargo_leg_xy == [
+        (6.0, 2.0), (5.0, 2.0), (4.0, 1.0), (3.0, 1.0), (2.0, 1.0), (1.0, 0.0), (0.0, 0.0),
+    ]
+    assert navigate_calls[7]["z"] == 1.5  # крейсерская высота над грузом
+
     # Снижение к грузу для захвата
-    assert navigate_calls[2]["x"] == 3.0 and navigate_calls[2]["y"] == 0.0
-    assert navigate_calls[2]["z"] == 0.3
+    assert navigate_calls[8]["x"] == 0.0 and navigate_calls[8]["y"] == 0.0
+    assert navigate_calls[8]["z"] == 0.3
 
     # Захват груза произошёл между снижением и подъёмом обратно
     assert gripper_calls[1] == "close"
 
     # Подъём обратно над грузом
-    assert navigate_calls[3]["x"] == 3.0 and navigate_calls[3]["z"] == 1.5
+    assert navigate_calls[9]["x"] == 0.0 and navigate_calls[9]["z"] == 1.5
 
-    # Полёт к станции с грузом
-    assert navigate_calls[4]["x"] == 5.0 and navigate_calls[4]["y"] == 0.0
-    assert navigate_calls[4]["auto_arm"] is False
+    # Путь к станции с грузом — тоже по соседним меткам решётки (0 -> 1 -> 2
+    # -> 3 -> 4 -> 5), без диагональных прыжков.
+    station_leg_xy = [(call["x"], call["y"]) for call in navigate_calls[10:15]]
+    assert station_leg_xy == [(1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0), (5.0, 0.0)]
 
     # Управляемый спуск на станцию завершился дизармом
     assert disarm_calls == [False]
@@ -394,10 +529,14 @@ def _self_test() -> int:
     # Сброс груза произошёл после зарядки, до повторного взлёта
     assert gripper_calls == ["open", "close", "open"]
 
-    # Повторный взлёт со станции и возврат на старт
-    assert navigate_calls[-2]["x"] == 5.0 and navigate_calls[-2]["y"] == 0.0
-    assert navigate_calls[-2]["auto_arm"] is True
-    assert navigate_calls[-1]["x"] == 6.0 and navigate_calls[-1]["y"] == 2.0
+    # Повторный взлёт со станции
+    assert navigate_calls[16]["x"] == 5.0 and navigate_calls[16]["y"] == 0.0
+    assert navigate_calls[16]["auto_arm"] is True
+
+    # Возврат на старт — по соседним меткам решётки (5 -> 13 -> 20)
+    return_leg_xy = [(call["x"], call["y"]) for call in navigate_calls[17:]]
+    assert return_leg_xy == [(6.0, 1.0), (6.0, 2.0)]
+    assert navigate_calls[-1]["auto_arm"] is False
 
     assert flight.state["armed"] is False  # завершили штатным land_wait
 
@@ -426,6 +565,7 @@ def _self_test() -> int:
             markers,
             config,
             rangefinder_reader=never_touchdown_rangefinder,
+            marker_id_reader=fts.fixed_marker_reader(20),
             sleep_fn=clock_no_touchdown.sleep,
             time_fn=clock_no_touchdown.time,
         )
@@ -464,6 +604,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--self-test",
         action="store_true",
         help="проверить логику миссии без ROS 1/дрона",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="без подробного пошагового вывода (по умолчанию вывод включён)",
     )
     return parser
 

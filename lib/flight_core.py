@@ -33,7 +33,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from time import sleep
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -132,6 +132,20 @@ def read_rangefinder_ros(timeout: float) -> float:
 
     message = rospy.wait_for_message("/rangefinder/range", Range, timeout=timeout)
     return float(message.range)
+
+
+def read_visible_marker_ids_ros(timeout: float) -> Tuple[int, ...]:
+    """Прочитать ID меток поля, видимых камерой прямо сейчас, с топика
+    ``aruco_detect/markers`` (пакет ``aruco_pose``, см. TASK.md).
+
+    Используется, чтобы подтвердить локализацию по ``aruco_map`` реальными
+    метками перед навигацией по ней (см. ``wait_for_markers_visible``), а не
+    просто число меток, как ``diagnosis.read_marker_count_ros``."""
+    import rospy
+    from aruco_pose.msg import MarkerArray
+
+    message = rospy.wait_for_message("aruco_detect/markers", MarkerArray, timeout=timeout)
+    return tuple(sorted(int(marker.id) for marker in message.markers))
 
 
 def _distance_3d(telemetry: Any, x: float, y: float, z: float) -> float:
@@ -293,6 +307,211 @@ def wait_until_stable(
                 )
             )
         sleep_fn(poll_interval)
+
+
+def wait_for_markers_visible(
+    marker_id_reader: Callable[[float], Sequence[int]],
+    *,
+    timeout: float = 10.0,
+    read_timeout: float = 1.0,
+    poll_interval: float = 0.3,
+    sleep_fn: Callable[[float], None] = sleep,
+    time_fn: Callable[[], float] = time.monotonic,
+    verbose: bool = False,
+) -> Tuple[int, ...]:
+    """Дождаться, пока камера увидит хоть одну метку поля, и вернуть их ID.
+
+    Сразу после взлёта TF ``aruco_map`` может быть ещё не готов или опираться
+    на устаревшую/недостоверную оценку позиции — реальный кадр случай на
+    площадке: дрон сразу после взлёта полетел на большой скорости вперёд и
+    врезался в сетку, ни разу не подтвердив локализацию видимой меткой.
+    Поэтому любая навигация в ``frame_id='aruco_map'`` должна идти только
+    после того, как эта функция вернула непустой список — до этого доверять
+    ``aruco_map`` нельзя.
+    """
+    if timeout <= 0:
+        raise ValueError("timeout должен быть больше нуля")
+
+    deadline = time_fn() + timeout
+    while True:
+        try:
+            marker_ids: Tuple[int, ...] = tuple(marker_id_reader(read_timeout))
+        except Exception as exc:
+            marker_ids = ()
+            if verbose:
+                print(
+                    "[wait_for_markers_visible] метки не прочитаны ({}: {})".format(
+                        type(exc).__name__, exc
+                    )
+                )
+        if verbose:
+            print(
+                "[wait_for_markers_visible] видимые метки поля: {}".format(
+                    list(marker_ids)
+                )
+            )
+        if marker_ids:
+            return marker_ids
+        if time_fn() >= deadline:
+            raise TimeoutError(
+                "wait_for_markers_visible: ни одной метки поля не видно за {}с - "
+                "aruco_map недостоверен".format(timeout)
+            )
+        sleep_fn(poll_interval)
+
+
+def nearest_marker_id(
+    markers: Dict[int, Tuple[float, float, float]],
+    candidate_ids: Sequence[int],
+    x: float,
+    y: float,
+) -> int:
+    """ID метки из ``candidate_ids``, ближайшей к (x, y) по карте поля.
+
+    Используется, чтобы выбрать метку для привязки/стабилизации локализации
+    среди реально видимых камерой ID (см. ``wait_for_markers_visible``), а не
+    полагаться на первую попавшуюся - она может быть на другом конце поля,
+    если по карте случайно совпали id."""
+    known_candidates = [
+        marker_id for marker_id in candidate_ids if marker_id in markers
+    ]
+    if not known_candidates:
+        raise KeyError(
+            "Ни одна из видимых меток {} не найдена в карте поля".format(
+                list(candidate_ids)
+            )
+        )
+
+    def _distance_sq(marker_id: int) -> float:
+        mx, my, _mz = markers[marker_id]
+        return (mx - x) ** 2 + (my - y) ** 2
+
+    return min(known_candidates, key=_distance_sq)
+
+
+def _bresenham_line(x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
+    """Целочисленные узлы решётки на прямой от (x0, y0) до (x1, y1) включительно."""
+    points: List[Tuple[int, int]] = []
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    x, y = x0, y0
+    while True:
+        points.append((x, y))
+        if x == x1 and y == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x += sx
+        if e2 <= dx:
+            err += dx
+            y += sy
+    return points
+
+
+def marker_path(
+    markers: Dict[int, Tuple[float, float, float]],
+    start_id: int,
+    goal_id: int,
+    *,
+    grid_step: float = 1.0,
+) -> Tuple[int, ...]:
+    """Путь по соседним меткам решётки поля от ``start_id`` до ``goal_id``
+    включительно (``start_id`` - первый элемент, ``goal_id`` - последний).
+
+    Поле - равномерная решётка ArUco с шагом ``grid_step`` (1 м, см.
+    config/field_map.txt/TASK.md), поэтому путь растеризуется по узлам
+    решётки алгоритмом Брезенхэма вместо одного длинного прыжка по
+    диагонали: дрон идёт «метка за меткой» и не теряет локализацию по
+    aruco_map между стартом и целью (см. docstring wait_for_markers_visible
+    про то, к какой аварии на площадке привёл прямой прыжок).
+    """
+    if start_id not in markers:
+        raise KeyError("Метка {} отсутствует в карте поля".format(start_id))
+    if goal_id not in markers:
+        raise KeyError("Метка {} отсутствует в карте поля".format(goal_id))
+    if grid_step <= 0:
+        raise ValueError("grid_step должен быть больше нуля")
+
+    grid_index: Dict[Tuple[int, int], int] = {}
+    for marker_id, (x, y, _z) in markers.items():
+        grid_index[(round(x / grid_step), round(y / grid_step))] = marker_id
+
+    start_x, start_y, _start_z = markers[start_id]
+    goal_x, goal_y, _goal_z = markers[goal_id]
+    gx0, gy0 = round(start_x / grid_step), round(start_y / grid_step)
+    gx1, gy1 = round(goal_x / grid_step), round(goal_y / grid_step)
+
+    path_ids: List[int] = []
+    for gx, gy in _bresenham_line(gx0, gy0, gx1, gy1):
+        marker_id = grid_index.get((gx, gy))
+        if marker_id is None:
+            raise KeyError(
+                "На решётке карты нет метки в узле ({}, {}) на пути {} -> {}".format(
+                    gx, gy, start_id, goal_id
+                )
+            )
+        if not path_ids or path_ids[-1] != marker_id:
+            path_ids.append(marker_id)
+    return tuple(path_ids)
+
+
+def fly_marker_path(
+    navigate: Callable[..., Any],
+    get_telemetry: Callable[..., Any],
+    markers: Dict[int, Tuple[float, float, float]],
+    path: Sequence[int],
+    *,
+    z: float,
+    speed: float,
+    navigate_tolerance: float = 0.2,
+    navigate_timeout: float = 30.0,
+    stabilize_tolerance: float = 0.2,
+    stabilize_hold: float = 0.5,
+    stabilize_timeout: float = 5.0,
+    sleep_fn: Callable[[float], None] = sleep,
+    time_fn: Callable[[], float] = time.monotonic,
+    verbose: bool = False,
+) -> None:
+    """Пролететь путь меток ``path`` (см. ``marker_path``) от второго элемента
+    до последнего, стабилизируясь над каждой меткой перед следующим перегоном.
+
+    Дрон крупный: резкий перелёт большим прыжком (пропуская промежуточные
+    метки) непредсказуем так же, как один длинный прыжок через всё поле -
+    поэтому каждый перегон короткий (один шаг решётки) и завершается
+    стабилизацией, а не только прибытием в допуск ``navigate_wait``.
+    """
+    for marker_id in path[1:]:
+        leg_x, leg_y = marker_xy(markers, marker_id)
+        navigate_wait(
+            navigate,
+            get_telemetry,
+            x=leg_x,
+            y=leg_y,
+            z=z,
+            speed=speed,
+            frame_id="aruco_map",
+            tolerance=navigate_tolerance,
+            timeout=navigate_timeout,
+            sleep_fn=sleep_fn,
+            time_fn=time_fn,
+            verbose=verbose,
+        )
+        wait_until_stable(
+            get_telemetry,
+            x=leg_x,
+            y=leg_y,
+            frame_id="aruco_map",
+            tolerance=stabilize_tolerance,
+            hold_time=stabilize_hold,
+            timeout=stabilize_timeout,
+            sleep_fn=sleep_fn,
+            time_fn=time_fn,
+            verbose=verbose,
+        )
 
 
 def controlled_descent_and_disarm(
@@ -549,6 +768,97 @@ def _self_test() -> int:
         sleep_fn=fake_sleep,
         time_fn=fake_time,
     )
+
+    # wait_for_markers_visible: ждёт, пока появится непустой список меток
+    clock[0] = 0.0
+    marker_reads = iter([(), (), (3, 7)])
+
+    def fake_marker_reader(_timeout: float) -> Tuple[int, ...]:
+        return next(marker_reads)
+
+    seen = wait_for_markers_visible(
+        fake_marker_reader,
+        timeout=5.0,
+        poll_interval=0.5,
+        sleep_fn=fake_sleep,
+        time_fn=fake_time,
+    )
+    assert seen == (3, 7)
+
+    # wait_for_markers_visible: таймаут, если меток так и не видно
+    clock[0] = 0.0
+    try:
+        wait_for_markers_visible(
+            lambda _timeout: (),
+            timeout=1.0,
+            poll_interval=0.5,
+            sleep_fn=fake_sleep,
+            time_fn=fake_time,
+        )
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("Ожидался TimeoutError")
+
+    # nearest_marker_id: выбирает ближайшую к (x, y) метку среди видимых
+    markers_for_nearest = {1: (0.0, 0.0, 0.0), 2: (5.0, 0.0, 0.0), 3: (5.0, 5.0, 0.0)}
+    assert nearest_marker_id(markers_for_nearest, [1, 2, 3], 4.5, 0.5) == 2
+    try:
+        nearest_marker_id(markers_for_nearest, [99], 0.0, 0.0)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("Ожидался KeyError - ни одна видимая метка не на карте")
+
+    # marker_path: растеризует путь по решётке 7x7, не перепрыгивая метки
+    grid_markers: Dict[int, Tuple[float, float, float]] = {}
+    for row in range(7):
+        for col in range(7):
+            grid_markers[row * 7 + col] = (float(col), float(row), 0.0)
+
+    path = marker_path(grid_markers, 48, 37)  # (6,6) -> (2,5), не одним прыжком
+    assert path == (48, 47, 39, 38, 37)
+    try:
+        marker_path(grid_markers, 999, 37)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("Ожидался KeyError для отсутствующей стартовой метки")
+
+    # fly_marker_path: летит по каждому перегону пути и стабилизируется на
+    # каждой метке (не только прибывает в допуск navigate_wait) - "телепорт"
+    # по тому же принципу, что FakeFlight в flight_test_support.py.
+    fly_navigate_calls = []
+    fly_stable_reads = 0
+    fly_state = {"x": 0.0, "y": 0.0, "z": 0.0}
+
+    def fake_fly_navigate(*, x: float, y: float, z: float, **_kwargs: object) -> None:
+        fly_navigate_calls.append({"x": x, "y": y})
+        fly_state["x"], fly_state["y"], fly_state["z"] = x, y, z
+
+    def fake_fly_get_telemetry(*, frame_id: str = "aruco_map", **_kwargs: object) -> FakeTelemetry:
+        nonlocal fly_stable_reads
+        if frame_id == "navigate_target":
+            return FakeTelemetry(0.0, 0.0, 0.0)  # мгновенное прибытие
+        fly_stable_reads += 1
+        return FakeTelemetry(fly_state["x"], fly_state["y"], fly_state["z"])
+
+    clock[0] = 0.0
+    fly_marker_path(
+        fake_fly_navigate,
+        fake_fly_get_telemetry,
+        grid_markers,
+        path,
+        z=1.5,
+        speed=0.3,
+        stabilize_hold=0.3,
+        stabilize_timeout=2.0,
+        sleep_fn=fake_sleep,
+        time_fn=fake_time,
+    )
+    assert len(fly_navigate_calls) == len(path) - 1  # первый элемент пути - старт, не перегон
+    assert (fly_navigate_calls[-1]["x"], fly_navigate_calls[-1]["y"]) == grid_markers[37][:2]
+    assert fly_stable_reads > 0  # действительно стабилизировался на каждой метке, а не просто прилетел
 
     # controlled_descent_and_disarm: касание определяется дальномером
     descent_navigate_calls = []
