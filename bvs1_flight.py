@@ -50,6 +50,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -113,9 +114,10 @@ class MissionConfig:
     # может не видеть ничего - по умолчанию предполётная проверка только
     # печатает результат. Жёсткий режим (--require-preflight) отменяет взлёт.
     require_preflight_localization: bool = False
-    # yaw=NaN в Clover-совместимом API означает «сохранять текущий курс»; на
-    # Skyris не подтверждено, поэтому по умолчанию yaw не передаётся вовсе.
-    hold_yaw: bool = False
+    # Курс в полёте не меняется (fc.HOLD_YAW = yaw=NaN, «сохранять текущий
+    # курс»). Разворачиваться по yaw миссии незачем: камера смотрит вниз,
+    # метки читаются при любой ориентации. Выключается --no-hold-yaw.
+    hold_yaw: bool = True
     # Реальный тайминг регламента (Табл.1): 15с красная мигающая + 5с зелёная
     # перед взлётом. Переопределяется через --charge-wait для тестовых
     # попыток, если нужно ускорить итерацию.
@@ -140,7 +142,7 @@ class MissionConfig:
         )
 
     def yaw(self) -> Optional[float]:
-        return float("nan") if self.hold_yaw else None
+        return fc.HOLD_YAW if self.hold_yaw else None
 
 
 def _confirm_localization(
@@ -266,6 +268,7 @@ def run_mission(
         speed=config.approach_speed,
         frame_id="body",
         auto_arm=True,
+        yaw=config.yaw(),
         tolerance=config.navigate_tolerance_m,
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
@@ -405,6 +408,7 @@ def run_mission(
         touchdown_threshold=config.touchdown_threshold_m,
         speed=config.descent_speed,
         frame_id="aruco_map",
+        yaw=config.yaw(),
         sleep_fn=sleep_fn,
         verbose=verbose,
     )
@@ -448,6 +452,7 @@ def run_mission(
         speed=config.approach_speed,
         frame_id="body",
         auto_arm=True,
+        yaw=config.yaw(),
         tolerance=config.navigate_tolerance_m,
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
@@ -597,6 +602,16 @@ def _self_test() -> int:
 
         assert flight.state["armed"] is False, mode  # завершили штатным land_wait
 
+        # Курс не меняется ни на одной команде: yaw=NaN («держать текущий»).
+        # Без этого сервис подставляет yaw=0, что в кадре aruco_map означает
+        # разворот носом по оси X карты — дрон крутился на каждом перегоне.
+        assert all(math.isnan(call["yaw"]) for call in calls), mode
+
+    # Запасной режим --no-hold-yaw: yaw не передаётся вовсе (на случай, если
+    # прошивка не поймёт NaN), а не подставляется числом.
+    assert MissionConfig(hold_yaw=False).yaw() is None
+    assert math.isnan(MissionConfig().yaw())
+
     patterns = [entry for entry in recorded_leds if entry[0] in ("fill", "blink", "rainbow")]
     assert patterns[0] == ("blink", (255, 255, 0))  # взлёт
     assert patterns[1] == ("fill", (255, 0, 0))  # поиск станции
@@ -711,10 +726,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "(по умолчанию дрон закрывает стартовую метку и на земле её не видит)",
     )
     parser.add_argument(
-        "--hold-yaw",
-        action="store_true",
-        help="передавать yaw=NaN («сохранять текущий курс») — на Skyris не "
-        "подтверждено, включать только после проверки на площадке",
+        "--no-hold-yaw",
+        dest="hold_yaw",
+        action="store_false",
+        help="не передавать yaw в navigate() (прежнее поведение: дрон "
+        "доворачивает носом по оси X карты и крутится в полёте) — запасной "
+        "вариант, если прошивка не понимает yaw=NaN",
     )
     parser.add_argument("--charge-wait", type=float, default=defaults.charge_wait_total_s)
     parser.add_argument(

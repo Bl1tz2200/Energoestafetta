@@ -30,10 +30,24 @@ MAVROS, но не подтверждено явно документацией S
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from time import sleep
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+
+# «Сохранять текущий курс»: в Clover-совместимом API (пакет ``technic``)
+# yaw=NaN означает «не разворачивать дрон, удерживать текущий курс», а
+# yaw_rate по умолчанию 0 — то есть дрон летит боком/задом, но не крутится.
+# Это значение по умолчанию во всех навигационных функциях модуля, потому
+# что штатное значение сервиса (yaw=0) в кадре ``aruco_map`` означает
+# «развернуться носом по оси X карты» — дрон доворачивался на каждой команде
+# navigate(), что видно в полёте как постоянное вращение по курсу.
+# Разворот по курсу не нужен ни на одном этапе миссии: камера смотрит вниз,
+# метки распознаются при любой ориентации, а лишнее вращение сбивает
+# локализацию по aruco_map и раскачивает крупный дрон.
+HOLD_YAW = float("nan")
 
 
 @dataclass(frozen=True)
@@ -165,7 +179,7 @@ def navigate_wait(
     speed: float = 0.5,
     frame_id: str = "aruco_map",
     auto_arm: bool = False,
-    yaw: Optional[float] = None,
+    yaw: Optional[float] = HOLD_YAW,
     tolerance: float = 0.2,
     timeout: float = 30.0,
     poll_interval: float = 0.2,
@@ -196,12 +210,15 @@ def navigate_wait(
     контроля дрон летит к цели до таймаута, даже если цель заведомо
     неверна (авария на площадке — вылет за поле).
 
-    ``yaw`` по умолчанию не передаётся в navigate() вообще — используется
-    значение сервиса по умолчанию (0 в указанном ``frame_id``: для ``body``
-    это «не менять курс», для ``aruco_map`` — «развернуться носом по оси X
-    карты»). ``yaw=float('nan')`` в Clover-совместимом API означает
-    «сохранять текущий курс» — на Skyris не подтверждено, поэтому включается
-    явным флагом (см. ``--hold-yaw`` в bvs1_flight.py), а не по умолчанию.
+    ``yaw`` по умолчанию — ``HOLD_YAW`` (NaN, «сохранять текущий курс»), см.
+    комментарий у самой константы. Раньше yaw не передавался вовсе, и сервис
+    подставлял своё значение по умолчанию (0 в указанном ``frame_id``): в
+    ``body`` это безобидное «не менять курс», а в ``aruco_map`` —
+    «развернуться носом по оси X карты», из-за чего дрон доворачивал на
+    каждой команде navigate() и крутился в полёте. ``yaw=None`` возвращает
+    прежнее поведение (не передавать yaw вообще) — это запасной вариант на
+    случай, если NaN не поддержан прошивкой (см. ``--no-hold-yaw`` в
+    bvs1_flight.py/bvs2_flight.py); числовое значение задаёт курс явно.
     """
     if tolerance <= 0:
         raise ValueError("tolerance должен быть больше нуля")
@@ -264,6 +281,11 @@ def hover_in_place(
     Нужен как первая реакция на любую аварийную ситуацию в полёте (потеря
     локализации, выход за геозону): прервать уже отданную асинхронную команду
     navigate() иначе нечем — новая команда просто заменяет старую цель.
+
+    ``yaw`` здесь сознательно не передаётся (в отличие от ``navigate_wait``):
+    в кадре ``body`` значение сервиса по умолчанию (yaw=0) уже означает «не
+    менять курс», а аварийный стоп не должен зависеть от того, поддержана ли
+    прошивкой запись NaN.
     """
     if verbose:
         print("[hover_in_place] стоп: navigate(0, 0, 0, frame_id='body')")
@@ -526,6 +548,7 @@ def fly_marker_path(
     *,
     z: float,
     speed: float,
+    yaw: Optional[float] = HOLD_YAW,
     navigate_tolerance: float = 0.2,
     navigate_timeout: float = 30.0,
     stabilize_tolerance: float = 0.2,
@@ -567,6 +590,7 @@ def fly_marker_path(
             z=z,
             speed=speed,
             frame_id="aruco_map",
+            yaw=yaw,
             tolerance=navigate_tolerance,
             timeout=navigate_timeout,
             sleep_fn=sleep_fn,
@@ -608,6 +632,7 @@ def controlled_descent_and_disarm(
     touchdown_threshold: float = 0.12,
     speed: float = 0.3,
     frame_id: str = "aruco_map",
+    yaw: Optional[float] = HOLD_YAW,
     step_settle_time: float = 0.6,
     rangefinder_timeout: float = 1.0,
     max_steps: int = 200,
@@ -623,6 +648,10 @@ def controlled_descent_and_disarm(
     высота куба минус небольшой запас): если дальномер за ``max_steps`` так и
     не покажет касание, спуск всё равно остановится на этой высоте, а не
     продолжится бесконечно/до столкновения.
+
+    ``yaw`` — как в ``navigate_wait`` (по умолчанию ``HOLD_YAW``): доворот по
+    курсу прямо над кубом смещает дрон в горизонте и грозит штрафом за ножки
+    за границей метки, поэтому курс на спуске не меняется.
     """
     if step <= 0:
         raise ValueError("step должен быть больше нуля")
@@ -635,8 +664,15 @@ def controlled_descent_and_disarm(
     last_range: Optional[float] = None
     touchdown = False
 
+    descent_request: Dict[str, Any] = {
+        "speed": speed,
+        "frame_id": frame_id,
+    }
+    if yaw is not None:
+        descent_request["yaw"] = yaw
+
     for step_number in range(max_steps):
-        navigate(x=x, y=y, z=current_z, speed=speed, frame_id=frame_id)
+        navigate(x=x, y=y, z=current_z, **descent_request)
         sleep_fn(step_settle_time)
 
         try:
@@ -804,8 +840,22 @@ def _self_test() -> int:
     else:
         raise AssertionError("Ожидался TimeoutError")
 
-    # navigate_wait: yaw передаётся в navigate() только если задан явно
-    # (иначе используется значение сервиса по умолчанию - см. докстринг)
+    # navigate_wait: по умолчанию курс удерживается (yaw=NaN), иначе дрон
+    # доворачивает носом по оси X карты на каждой команде и крутится в полёте
+    assert math.isnan(navigate_calls[-1]["yaw"])
+    clock[0] = 0.0
+    navigate_wait(
+        fake_navigate,
+        lambda **_kwargs: FakeTelemetry(0.0, 0.0, 0.0),
+        x=1.0,
+        y=1.0,
+        z=1.5,
+        yaw=None,
+        timeout=1.0,
+        sleep_fn=fake_sleep,
+        time_fn=fake_time,
+    )
+    # yaw=None - запасной режим «не передавать yaw вовсе» (--no-hold-yaw)
     assert "yaw" not in navigate_calls[-1]
     clock[0] = 0.0
     navigate_wait(
@@ -814,12 +864,12 @@ def _self_test() -> int:
         x=1.0,
         y=1.0,
         z=1.5,
-        yaw=float("nan"),
+        yaw=1.57,
         timeout=1.0,
         sleep_fn=fake_sleep,
         time_fn=fake_time,
     )
-    assert "yaw" in navigate_calls[-1]
+    assert navigate_calls[-1]["yaw"] == 1.57
 
     # navigate_wait: guard прерывает уже отданную команду navigate() - без
     # этого дрон летит к неверной цели до самого таймаута (авария на площадке)

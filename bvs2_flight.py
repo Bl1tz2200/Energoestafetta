@@ -42,12 +42,13 @@ docs.skyris.ru/technic6S/ArucoMap.html), а не по прямому визуа�
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from time import sleep
-from typing import Callable, Dict, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
@@ -100,7 +101,13 @@ class MissionConfig:
     # --charge-wait для тестовых попыток, если нужно ускорить итерацию.
     charge_wait_total_s: float = 15.0
     charge_green_before_takeoff_s: float = 5.0
+    # Курс в полёте не меняется (fc.HOLD_YAW = yaw=NaN) — как в bvs1_flight.py,
+    # см. комментарий у самой константы. Выключается --no-hold-yaw.
+    hold_yaw: bool = True
     node_name: str = "bvs2_flight"
+
+    def yaw(self) -> Optional[float]:
+        return fc.HOLD_YAW if self.hold_yaw else None
 
 
 def run_mission(
@@ -147,6 +154,7 @@ def run_mission(
         speed=config.approach_speed,
         frame_id="body",
         auto_arm=True,
+        yaw=config.yaw(),
         tolerance=config.navigate_tolerance_m,
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
@@ -192,6 +200,7 @@ def run_mission(
         z=config.cruise_altitude_m,
         speed=config.approach_speed,
         frame_id="aruco_map",
+        yaw=config.yaw(),
         tolerance=config.navigate_tolerance_m,
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
@@ -229,6 +238,7 @@ def run_mission(
         cargo_path,
         z=config.cruise_altitude_m,
         speed=config.descent_speed,
+        yaw=config.yaw(),
         navigate_tolerance=config.navigate_tolerance_m,
         navigate_timeout=config.navigate_timeout_s,
         stabilize_tolerance=config.stabilize_tolerance_m,
@@ -270,6 +280,7 @@ def run_mission(
         z=config.pickup_altitude_m,
         speed=config.descent_speed,
         frame_id="aruco_map",
+        yaw=config.yaw(),
         tolerance=config.navigate_tolerance_m,
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
@@ -287,6 +298,7 @@ def run_mission(
         z=config.cruise_altitude_m,
         speed=config.approach_speed,
         frame_id="aruco_map",
+        yaw=config.yaw(),
         tolerance=config.navigate_tolerance_m,
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
@@ -313,6 +325,7 @@ def run_mission(
         station_path,
         z=config.cruise_altitude_m,
         speed=config.descent_speed,
+        yaw=config.yaw(),
         navigate_tolerance=config.navigate_tolerance_m,
         navigate_timeout=config.navigate_timeout_s,
         stabilize_tolerance=config.stabilize_tolerance_m,
@@ -354,6 +367,7 @@ def run_mission(
         touchdown_threshold=config.touchdown_threshold_m,
         speed=config.descent_speed,
         frame_id="aruco_map",
+        yaw=config.yaw(),
         sleep_fn=sleep_fn,
         verbose=verbose,
     )
@@ -398,6 +412,7 @@ def run_mission(
         speed=config.approach_speed,
         frame_id="aruco_map",
         auto_arm=True,
+        yaw=config.yaw(),
         tolerance=config.navigate_tolerance_m,
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
@@ -421,6 +436,7 @@ def run_mission(
         return_path,
         z=config.cruise_altitude_m,
         speed=config.descent_speed,
+        yaw=config.yaw(),
         navigate_tolerance=config.navigate_tolerance_m,
         navigate_timeout=config.navigate_timeout_s,
         stabilize_tolerance=config.stabilize_tolerance_m,
@@ -550,6 +566,14 @@ def _self_test() -> int:
 
     assert flight.state["armed"] is False  # завершили штатным land_wait
 
+    # Курс не меняется ни на одной команде: yaw=NaN («держать текущий»). Без
+    # этого сервис подставляет yaw=0, что в кадре aruco_map означает разворот
+    # носом по оси X карты — дрон крутился на каждом перегоне (как и в БВС-1).
+    assert all(math.isnan(call["yaw"]) for call in navigate_calls)
+    # Запасной режим --no-hold-yaw: yaw не передаётся вовсе, а не числом
+    assert MissionConfig(hold_yaw=False).yaw() is None
+    assert math.isnan(MissionConfig().yaw())
+
     patterns = [entry for entry in recorded_leds if entry[0] in ("fill", "blink", "rainbow")]
     assert patterns[0] == ("blink", (255, 255, 0))  # взлёт / полёт к грузу
     assert patterns[1] == ("fill", (255, 0, 0))  # захват груза
@@ -611,6 +635,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gripper-open-pulse", type=int, default=defaults.gripper_open_pulse)
     parser.add_argument("--gripper-close-pulse", type=int, default=defaults.gripper_close_pulse)
     parser.add_argument(
+        "--no-hold-yaw",
+        dest="hold_yaw",
+        action="store_false",
+        help="не передавать yaw в navigate() (прежнее поведение: дрон "
+        "доворачивает носом по оси X карты и крутится в полёте) — запасной "
+        "вариант, если прошивка не понимает yaw=NaN",
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="проверить логику миссии без ROS 1/дрона",
@@ -643,6 +675,7 @@ def main() -> int:
         gripper_pin=args.gripper_pin,
         gripper_open_pulse=args.gripper_open_pulse,
         gripper_close_pulse=args.gripper_close_pulse,
+        hold_yaw=args.hold_yaw,
     )
 
     markers = fc.read_map(config.map_path)

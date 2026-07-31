@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import flight_core as fc
 import led_interface as led
@@ -86,10 +86,21 @@ class FakeFlight:
         speed: float,
         frame_id: str,
         auto_arm: bool = False,
-        yaw: float = 0.0,
+        yaw: Optional[float] = None,
     ) -> None:
+        # yaw=None в записи означает «параметр вообще не передавали» (сервис
+        # подставил бы своё значение по умолчанию) — самотесты сценариев
+        # отличают это от явного удержания курса yaw=NaN. На «полёт» заглушки
+        # курс не влияет: перемещение в body считается по state['yaw'].
         self.navigate_calls.append(
-            {"x": x, "y": y, "z": z, "frame_id": frame_id, "auto_arm": auto_arm}
+            {
+                "x": x,
+                "y": y,
+                "z": z,
+                "frame_id": frame_id,
+                "auto_arm": auto_arm,
+                "yaw": yaw,
+            }
         )
         if frame_id == "body":
             drone_yaw = self.state["yaw"]

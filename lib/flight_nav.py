@@ -485,7 +485,7 @@ def fly_to(
     z: float,
     mode: str = "map",
     limits: FlightLimits = FlightLimits(),
-    yaw: Optional[float] = None,
+    yaw: Optional[float] = fc.HOLD_YAW,
     sleep_fn: Callable[[float], None] = sleep,
     time_fn: Callable[[], float] = time.monotonic,
     verbose: bool = False,
@@ -509,6 +509,12 @@ def fly_to(
       поэтому рывки TF не превращаются в рывки дрона. Платой идёт дрейф по
       высоте и курсу — за перегон в 1 м он мал, но проверять надо на
       площадке.
+
+    ``yaw`` по умолчанию — ``fc.HOLD_YAW`` (курс не меняется, дрон летит к
+    цели боком/задом). Это важно именно здесь: в режиме ``relative`` вектор
+    перегона пересчитывается в кадр ``body`` по текущему курсу
+    (``map_vector_to_body``), поэтому доворот во время перегона уводил бы
+    дрон в сторону от рассчитанного направления.
 
     Возвращает последний подтверждённый ``LocalizationStatus``. Бросает
     ``NavigationAbort`` (``LocalizationLost``/``GeofenceBreach``/
@@ -629,6 +635,10 @@ def fly_to(
                         -limits.max_climb_per_leg_m,
                         min(limits.max_climb_per_leg_m, z - status.z),
                     )
+                # Числовой курс задаётся в кадре карты, а в 'body' то же число
+                # означало бы совсем другой разворот — здесь поддержано только
+                # удержание курса (HOLD_YAW/None, оба = «не менять курс»).
+                body_yaw = yaw if yaw is None or math.isnan(yaw) else None
                 fc.navigate_wait(
                     navigate,
                     get_telemetry,
@@ -637,6 +647,7 @@ def fly_to(
                     z=body_z,
                     speed=limits.speed,
                     frame_id="body",
+                    yaw=body_yaw,
                     tolerance=limits.navigate_tolerance_m,
                     timeout=limits.navigate_timeout_s,
                     guard=guard,
