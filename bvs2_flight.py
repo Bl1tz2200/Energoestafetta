@@ -4,8 +4,8 @@
 Реализует шаги 1, 2, 4, 5, 6, 8 алгоритма из TASK.md: синхронный взлёт с
 БВС-1 → полёт в зону захвата груза (метка 0) → захват зависанием на заданной
 высоте → полёт со грузом к собственной зарядной станции БВС-2 (в этой
-раскладке — метка 5, физически отдельный тёмно-синий куб 80 см, НЕ та же
-станция, что использует БВС-1 на метке 37 — у каждого БВС своя станция) →
+раскладке — метка 37, физически отдельный тёмно-синий куб 80 см, НЕ та же
+станция, что использует БВС-1 на метке 5 — у каждого БВС своя станция) →
 управляемая посадка на куб + имитация зарядки → сброс груза → повторный
 взлёт → возврат на старт → штатная посадка.
 
@@ -31,7 +31,7 @@ docs.skyris.ru/technic6S/ArucoMap.html), а не по прямому визуа�
 Запуск на дроне::
 
     python3 bvs2_flight.py --map config/field_map.txt --start-marker <N> \\
-        --cargo-marker 0 --station-marker 5 --station-height 0.8 \\
+        --cargo-marker 0 --station-marker 37 --station-height 0.8 \\
         --gripper-pin <N> --gripper-open-pulse <N> --gripper-close-pulse <N>
 
 Проверка модуля без ROS 1/дрона::
@@ -73,7 +73,7 @@ class MissionConfig:
     map_path: str = "config/field_map.txt"
     start_marker_id: int = 0
     cargo_marker_id: int = 0
-    station_marker_id: int = 5
+    station_marker_id: int = 37
     station_height_m: float = 0.8
     landing_safety_margin_m: float = 0.1
     cruise_altitude_m: float = 1.5
@@ -234,6 +234,8 @@ def run_mission(
         stabilize_tolerance=config.stabilize_tolerance_m,
         stabilize_hold=config.stabilize_hold_s,
         stabilize_timeout=config.stabilize_timeout_s,
+        marker_id_reader=marker_id_reader,
+        markers_visible_timeout=config.markers_visible_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
         verbose=verbose,
@@ -293,29 +295,35 @@ def run_mission(
     )
 
     # 6. Полёт к собственной зарядной станции БВС-2 с грузом поочерёдно по
-    # меткам сетки, не перепрыгивая их — индикация не меняется (красная
-    # лента, по тексту шага 5 алгоритма).
+    # меткам сетки, не перепрыгивая их (flight_core.marker_path) — индикация
+    # не меняется (красная лента, по тексту шага 5 алгоритма). Дрон крупный,
+    # поэтому, как и на пути к грузу в шаге 3, каждый перегон летит на
+    # пониженной скорости и завершается стабилизацией
+    # (flight_core.fly_marker_path), а не просто прибытием в допуск
+    # navigate_wait.
     if verbose:
         print("[run_mission] === Шаг 6: подлёт к станции по меткам сетки (frame_id=aruco_map) ===")
     station_path = fc.marker_path(markers, config.cargo_marker_id, config.station_marker_id)
     if verbose:
         print("[run_mission] путь по меткам до станции: {}".format(list(station_path)))
-    for marker_id in station_path[1:]:
-        leg_x, leg_y = fc.marker_xy(markers, marker_id)
-        fc.navigate_wait(
-            proxies.navigate,
-            proxies.get_telemetry,
-            x=leg_x,
-            y=leg_y,
-            z=config.cruise_altitude_m,
-            speed=config.approach_speed,
-            frame_id="aruco_map",
-            tolerance=config.navigate_tolerance_m,
-            timeout=config.navigate_timeout_s,
-            sleep_fn=sleep_fn,
-            time_fn=time_fn,
-            verbose=verbose,
-        )
+    fc.fly_marker_path(
+        proxies.navigate,
+        proxies.get_telemetry,
+        markers,
+        station_path,
+        z=config.cruise_altitude_m,
+        speed=config.descent_speed,
+        navigate_tolerance=config.navigate_tolerance_m,
+        navigate_timeout=config.navigate_timeout_s,
+        stabilize_tolerance=config.stabilize_tolerance_m,
+        stabilize_hold=config.stabilize_hold_s,
+        stabilize_timeout=config.stabilize_timeout_s,
+        marker_id_reader=marker_id_reader,
+        markers_visible_timeout=config.markers_visible_timeout_s,
+        sleep_fn=sleep_fn,
+        time_fn=time_fn,
+        verbose=verbose,
+    )
 
     # 7. Стабилизация и управляемый спуск на куб станции + ручной дизарм по
     # дальномеру (не полагаемся на land() — см. bvs1_flight.py/TASK.md)
@@ -398,30 +406,32 @@ def run_mission(
     )
 
     # 11. Возврат на исходную позицию поочерёдно по меткам сетки — зелёный
-    # мигающий (та же логика "не перепрыгивать метки", что и на пути к
-    # станции в шаге 6).
+    # мигающий (та же логика "не перепрыгивать метки" и плавных перегонов со
+    # стабилизацией, что и на пути к станции в шаге 6).
     if verbose:
         print("[run_mission] === Шаг 11: возврат на старт по меткам сетки ===")
     led.set_led("blink", "green")
     return_path = fc.marker_path(markers, config.station_marker_id, config.start_marker_id)
     if verbose:
         print("[run_mission] путь по меткам на старт: {}".format(list(return_path)))
-    for marker_id in return_path[1:]:
-        leg_x, leg_y = fc.marker_xy(markers, marker_id)
-        fc.navigate_wait(
-            proxies.navigate,
-            proxies.get_telemetry,
-            x=leg_x,
-            y=leg_y,
-            z=config.cruise_altitude_m,
-            speed=config.approach_speed,
-            frame_id="aruco_map",
-            tolerance=config.navigate_tolerance_m,
-            timeout=config.navigate_timeout_s,
-            sleep_fn=sleep_fn,
-            time_fn=time_fn,
-            verbose=verbose,
-        )
+    fc.fly_marker_path(
+        proxies.navigate,
+        proxies.get_telemetry,
+        markers,
+        return_path,
+        z=config.cruise_altitude_m,
+        speed=config.descent_speed,
+        navigate_tolerance=config.navigate_tolerance_m,
+        navigate_timeout=config.navigate_timeout_s,
+        stabilize_tolerance=config.stabilize_tolerance_m,
+        stabilize_hold=config.stabilize_hold_s,
+        stabilize_timeout=config.stabilize_timeout_s,
+        marker_id_reader=marker_id_reader,
+        markers_visible_timeout=config.markers_visible_timeout_s,
+        sleep_fn=sleep_fn,
+        time_fn=time_fn,
+        verbose=verbose,
+    )
 
     # 12. Штатная посадка — под стартовой меткой ровный пол, куба нет
     if verbose:
