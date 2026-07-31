@@ -156,22 +156,46 @@ def navigate_wait(
     poll_interval: float = 0.2,
     sleep_fn: Callable[[float], None] = sleep,
     time_fn: Callable[[], float] = time.monotonic,
+    verbose: bool = False,
 ) -> Any:
     """Отправить navigate() и заблокироваться до прибытия в точку.
 
     По образцу ``navigate_wait`` из docs.skyris.ru/technic6S/CodeExamples.html.
+    Прибытие проверяется телеметрией в ``frame_id='navigate_target'`` —
+    специальном фрейме, который отдаёт вектор «дрон -> текущая цель
+    navigate()» и сходится к (0, 0, 0) по мере приближения, независимо от
+    того, в каком ``frame_id`` задавалась сама цель. Проверять это тем же
+    ``frame_id``, что передан в ``navigate()``, некорректно для «подвижных»
+    фреймов вроде ``body`` (система координат самого дрона) — телеметрия
+    дрона относительно самого себя всегда около (0, 0, 0), поэтому цель
+    в ней в принципе недостижима и цикл всегда упирается в timeout,
+    независимо от реального поведения дрона (воспроизведено на площадке
+    2026-08-01 на взлёте с ``frame_id='body'``).
     """
     if tolerance <= 0:
         raise ValueError("tolerance должен быть больше нуля")
     if timeout <= 0:
         raise ValueError("timeout должен быть больше нуля")
 
+    if verbose:
+        print(
+            "[navigate_wait] navigate(x={:.2f}, y={:.2f}, z={:.2f}, speed={}, "
+            "frame_id={!r}, auto_arm={})".format(x, y, z, speed, frame_id, auto_arm)
+        )
     navigate(x=x, y=y, z=z, speed=speed, frame_id=frame_id, auto_arm=auto_arm)
 
     deadline = time_fn() + timeout
     while True:
-        telemetry = get_telemetry(frame_id=frame_id)
-        if _distance_3d(telemetry, x, y, z) <= tolerance:
+        telemetry = get_telemetry(frame_id="navigate_target")
+        distance = _distance_3d(telemetry, 0.0, 0.0, 0.0)
+        if verbose:
+            print(
+                "[navigate_wait] остаток до цели: dx={:.2f} dy={:.2f} dz={:.2f} "
+                "(|d|={:.2f}, допуск={:.2f})".format(
+                    telemetry.x, telemetry.y, telemetry.z, distance, tolerance
+                )
+            )
+        if distance <= tolerance:
             return telemetry
         if time_fn() >= deadline:
             raise TimeoutError(
@@ -190,17 +214,23 @@ def land_wait(
     poll_interval: float = 0.2,
     sleep_fn: Callable[[float], None] = sleep,
     time_fn: Callable[[], float] = time.monotonic,
+    verbose: bool = False,
 ) -> Any:
     """Вызвать land() и заблокироваться до дизарма."""
     if timeout <= 0:
         raise ValueError("timeout должен быть больше нуля")
 
+    if verbose:
+        print("[land_wait] land()")
     land()
 
     deadline = time_fn() + timeout
     while True:
         telemetry = get_telemetry()
-        if not getattr(telemetry, "armed", True):
+        armed = getattr(telemetry, "armed", True)
+        if verbose:
+            print("[land_wait] armed={}".format(armed))
+        if not armed:
             return telemetry
         if time_fn() >= deadline:
             raise TimeoutError(
@@ -221,6 +251,7 @@ def wait_until_stable(
     poll_interval: float = 0.2,
     sleep_fn: Callable[[float], None] = sleep,
     time_fn: Callable[[], float] = time.monotonic,
+    verbose: bool = False,
 ) -> Any:
     """Дождаться, пока x/y устоятся в пределах допуска ``hold_time`` секунд
     подряд, прежде чем начинать спуск («стабилизация» перед посадкой)."""
@@ -238,7 +269,17 @@ def wait_until_stable(
         dx = float(telemetry.x) - x
         dy = float(telemetry.y) - y
         now = time_fn()
-        if (dx * dx + dy * dy) ** 0.5 <= tolerance:
+        offset = (dx * dx + dy * dy) ** 0.5
+        if verbose:
+            print(
+                "[wait_until_stable] offset={:.2f} (допуск={:.2f}, "
+                "стабильно={})".format(
+                    offset,
+                    tolerance,
+                    "-" if stable_since is None else "{:.1f}с".format(now - stable_since),
+                )
+            )
+        if offset <= tolerance:
             if stable_since is None:
                 stable_since = now
             elif now - stable_since >= hold_time:
@@ -271,6 +312,7 @@ def controlled_descent_and_disarm(
     rangefinder_timeout: float = 1.0,
     max_steps: int = 200,
     sleep_fn: Callable[[float], None] = sleep,
+    verbose: bool = False,
 ) -> DescentResult:
     """Пошаговый спуск с контролем дальномера и ручной дизарм по касанию.
 
@@ -293,14 +335,28 @@ def controlled_descent_and_disarm(
     last_range: Optional[float] = None
     touchdown = False
 
-    for _ in range(max_steps):
+    for step_number in range(max_steps):
         navigate(x=x, y=y, z=current_z, speed=speed, frame_id=frame_id)
         sleep_fn(step_settle_time)
 
         try:
             last_range = rangefinder_reader(rangefinder_timeout)
-        except Exception:
+        except Exception as exc:
             last_range = None
+            if verbose:
+                print(
+                    "[controlled_descent] шаг {}: z={:.2f}, дальномер недоступен ({})".format(
+                        step_number, current_z, exc
+                    )
+                )
+        else:
+            if verbose:
+                print(
+                    "[controlled_descent] шаг {}: z={:.2f}, дальность={:.2f} "
+                    "(порог касания={:.2f})".format(
+                        step_number, current_z, last_range, touchdown_threshold
+                    )
+                )
 
         if last_range is not None and last_range <= touchdown_threshold:
             touchdown = True
@@ -309,6 +365,12 @@ def controlled_descent_and_disarm(
             break
         current_z = max(min_z, current_z - step)
 
+    if verbose:
+        print(
+            "[controlled_descent] итог: z={:.2f}, касание={}, дизарм".format(
+                current_z, touchdown
+            )
+        )
     arming(False)
     return DescentResult(
         final_z=current_z, touchdown_detected=touchdown, last_range=last_range
@@ -386,7 +448,11 @@ def _self_test() -> int:
     def fake_navigate(**kwargs: object) -> None:
         navigate_calls.append(kwargs)
 
-    telemetry_positions = iter([(5.0, 5.0, 0.0), (1.5, 1.5, 0.0), (1.05, 0.98, 1.5)])
+    # Телеметрия в frame_id='navigate_target' - это остаток пути до цели,
+    # сходящийся к (0, 0, 0) по мере приближения (см. docstring navigate_wait
+    # про то, почему проверять нужно именно этот фрейм, а не тот, что был
+    # передан в navigate()).
+    navtarget_positions = iter([(4.0, 4.0, 1.5), (0.5, 0.5, 1.5), (0.05, -0.02, 0.0)])
 
     class FakeTelemetry:
         def __init__(self, x: float, y: float, z: float) -> None:
@@ -394,7 +460,7 @@ def _self_test() -> int:
             self.armed = True
 
     def fake_get_telemetry(**_kwargs: object) -> FakeTelemetry:
-        x, y, z = next(telemetry_positions)
+        x, y, z = next(navtarget_positions)
         return FakeTelemetry(x, y, z)
 
     result = navigate_wait(
@@ -410,8 +476,11 @@ def _self_test() -> int:
         sleep_fn=fake_sleep,
         time_fn=fake_time,
     )
+    # navigate() сам вызывается с исходным (не navigate_target) frame_id
+    assert navigate_calls[-1]["x"] == 1.0 and navigate_calls[-1]["frame_id"] == "aruco_map"
     assert navigate_calls[-1]["auto_arm"] is True
-    assert abs(result.x - 1.05) < 1e-9
+    # а результат navigate_wait - это последняя телеметрия в navigate_target
+    assert abs(result.x - 0.05) < 1e-9 and abs(result.y - (-0.02)) < 1e-9
 
     # navigate_wait: таймаут, если цель никогда не достигается
     def fake_get_telemetry_far(**_kwargs: object) -> FakeTelemetry:

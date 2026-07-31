@@ -57,6 +57,7 @@ class FakeFlight:
             "z": start_z,
             "armed": False,
         }
+        self._last_target: Tuple[float, float, float] = (start_x, start_y, start_z)
         self.navigate_calls: List[Dict[str, Any]] = []
         self.disarm_calls: List[bool] = []
         self.proxies = fc.FlightProxies(
@@ -81,8 +82,20 @@ class FakeFlight:
         )
         self.state["x"], self.state["y"], self.state["z"] = x, y, z
         self.state["armed"] = True
+        self._last_target = (x, y, z)
 
-    def _get_telemetry(self, **_kwargs: object) -> FakeTelemetry:
+    def _get_telemetry(self, *, frame_id: str = "aruco_map", **_kwargs: object) -> FakeTelemetry:
+        if frame_id == "navigate_target":
+            # "телепорт" в _navigate() мгновенный, поэтому дрон уже в цели -
+            # остаток пути в этом фрейме всегда (0, 0, 0), как и должно быть
+            # у реального navigate_target сразу после прибытия.
+            tx, ty, tz = self._last_target
+            return FakeTelemetry(
+                self.state["x"] - tx,
+                self.state["y"] - ty,
+                self.state["z"] - tz,
+                self.state["armed"],
+            )
         return FakeTelemetry(
             self.state["x"], self.state["y"], self.state["z"], self.state["armed"]
         )

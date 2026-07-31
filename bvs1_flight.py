@@ -52,7 +52,7 @@ class MissionConfig:
     station_marker_id: int = 37
     station_height_m: float = 0.8
     landing_safety_margin_m: float = 0.1
-    cruise_altitude_m: float = 1.5
+    cruise_altitude_m: float = 2.0
     approach_speed: float = 0.5
     descent_speed: float = 0.3
     descent_step_m: float = 0.15
@@ -78,12 +78,22 @@ def run_mission(
     rangefinder_reader: Callable[[float], float] = fc.read_rangefinder_ros,
     sleep_fn: Callable[[float], None] = sleep,
     time_fn: Callable[[], float] = time.monotonic,
+    verbose: bool = False,
 ) -> None:
     """Выполнить полную миссию БВС-1. Не зависит от rospy напрямую — все
     ROS-вызовы приходят через ``proxies``, поэтому логику можно проверить
     самотестом с заглушками (см. ``_self_test``)."""
     start_x, start_y = fc.marker_xy(markers, config.start_marker_id)
     station_x, station_y = fc.marker_xy(markers, config.station_marker_id)
+    if verbose:
+        print(
+            "[run_mission] старт=({:.2f}, {:.2f}) [метка {}], станция=({:.2f}, {:.2f}) "
+            "[метка {}], высота станции={:.2f}м, крейсерская высота={:.2f}м".format(
+                start_x, start_y, config.start_marker_id,
+                station_x, station_y, config.station_marker_id,
+                config.station_height_m, config.cruise_altitude_m,
+            )
+        )
 
     # 1. Взлёт с исходной точки — жёлтый мигающий (Табл.1 регламента).
     # frame_id='body' (не 'aruco_map'): сразу после включения aruco_map ещё
@@ -93,6 +103,8 @@ def run_mission(
     # (navigate(x=0, y=0, z=1.5, frame_id='body', auto_arm=True)). Дрон уже
     # стоит над start_marker_id, так что боковое смещение не нужно — карта
     # поля используется начиная со следующего шага.
+    if verbose:
+        print("[run_mission] === Шаг 1: взлёт (frame_id=body) ===")
     led.set_led("blink", "yellow")
     fc.navigate_wait(
         proxies.navigate,
@@ -107,10 +119,13 @@ def run_mission(
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
 
     # 2. Поиск/подлёт к зарядной станции — красный. Летим по координатам из
     # карты поля, а не по видимой метке: метка станции физически закрыта.
+    if verbose:
+        print("[run_mission] === Шаг 2: подлёт к станции (frame_id=aruco_map) ===")
     led.set_led("solid", "red")
     fc.navigate_wait(
         proxies.navigate,
@@ -124,9 +139,12 @@ def run_mission(
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
 
     # 3. Стабилизация над станцией перед спуском
+    if verbose:
+        print("[run_mission] === Шаг 3: стабилизация над станцией ===")
     fc.wait_until_stable(
         proxies.get_telemetry,
         x=station_x,
@@ -137,10 +155,13 @@ def run_mission(
         timeout=config.stabilize_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
 
     # 4. Управляемый спуск на куб зарядной станции + ручной дизарм по
     # дальномеру (не полагаемся на land() — см. докстринг модуля)
+    if verbose:
+        print("[run_mission] === Шаг 4: управляемый спуск на станцию ===")
     min_z = config.station_height_m + config.landing_safety_margin_m
     descent = fc.controlled_descent_and_disarm(
         proxies.navigate,
@@ -155,6 +176,7 @@ def run_mission(
         speed=config.descent_speed,
         frame_id="aruco_map",
         sleep_fn=sleep_fn,
+        verbose=verbose,
     )
     if not descent.touchdown_detected:
         # Дизарм в controlled_descent_and_disarm уже произошёл (по safety-
@@ -172,6 +194,8 @@ def run_mission(
     # 5. Имитация зарядки: заглушка вместо честных 15с/5с (Табл.1) — общая
     # длительность configурируется, но соотношение «зелёный за N секунд до
     # взлёта» сохранено.
+    if verbose:
+        print("[run_mission] === Шаг 5: имитация зарядки ===")
     fc.simulate_charging(
         led.set_led,
         total_s=config.charge_wait_total_s,
@@ -180,6 +204,8 @@ def run_mission(
     )
 
     # 6. Повторный взлёт с куба до крейсерской высоты
+    if verbose:
+        print("[run_mission] === Шаг 6: повторный взлёт с куба ===")
     fc.navigate_wait(
         proxies.navigate,
         proxies.get_telemetry,
@@ -193,9 +219,12 @@ def run_mission(
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
 
     # 7. Возврат на исходную позицию — зелёный мигающий
+    if verbose:
+        print("[run_mission] === Шаг 7: возврат на старт ===")
     led.set_led("blink", "green")
     fc.navigate_wait(
         proxies.navigate,
@@ -209,15 +238,21 @@ def run_mission(
         timeout=config.navigate_timeout_s,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
 
     # 8. Штатная посадка — под стартовой меткой ровный пол, куба нет
+    if verbose:
+        print("[run_mission] === Шаг 8: посадка на старте ===")
     fc.land_wait(
         proxies.land,
         proxies.get_telemetry,
         sleep_fn=sleep_fn,
         time_fn=time_fn,
+        verbose=verbose,
     )
+    if verbose:
+        print("[run_mission] === Миссия завершена ===")
 
 
 def _self_test() -> int:
@@ -316,6 +351,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="проверить логику миссии без ROS 1/дрона",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="без подробного пошагового вывода (по умолчанию вывод включён)",
+    )
     return parser
 
 
@@ -337,7 +377,7 @@ def main() -> int:
     proxies = fc.init_flight(config.node_name)
     led.use_technic_ros1_backend()
     try:
-        run_mission(proxies, markers, config)
+        run_mission(proxies, markers, config, verbose=not args.quiet)
     finally:
         led.close_led_backend()
     return 0
