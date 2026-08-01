@@ -42,6 +42,14 @@
        python3 fly_to_marker.py        # без аргументов — то же самое
        python3 fly_to_marker.py 5 47   # взлетаем не с 48, а с метки 47
 
+Третий аргумент — своя карта поля, для проверки в Gazebo с другой раскладкой::
+
+       python3 fly_to_marker.py 12 0 ~/catkin_ws/src/my_field.txt
+
+Карту надо брать ИЗ ТОГО ЖЕ файла, который скормлен ноде ``aruco_map``
+(проверить: ``rosparam get /aruco_map/map``). Если файлы разные, дрон считает
+место по одной раскладке, а летит по другой — и уверенно улетает не туда.
+
 Второй аргумент — метка старта. Это ТОЧКА ВОЗВРАТА: именно в неё дрон летит
 после зарядки. На взлёт она не влияет (взлёт идёт в ``frame_id='body'`` —
 «вверх оттуда, где стою»), и видеть её камерой не нужно: место дрон берёт у
@@ -91,13 +99,18 @@ OFF = (0, 0, 0)
 # а не в воздухе.
 target = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_MARKER
 start = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_START
+# Третий аргумент — своя карта поля. Нужен в Gazebo: там раскладка меток
+# другая, и брать её надо ИЗ ТОГО ЖЕ файла, что скормлен ноде aruco_map,
+# иначе дрон считает место по одной карте, а летит по другой.
+map_path = sys.argv[3] if len(sys.argv) > 3 else MAP
 
-field = nav.read_field_map(MAP)
+field = nav.read_field_map(map_path)
 target_x, target_y = nav.marker_xy(field, target)
 start_x, start_y = nav.marker_xy(field, start)
 route_length = math.hypot(target_x - start_x, target_y - start_y)
 
 print("─" * 58)
+print("карта  {}".format(map_path))
 print("старт  метка {:>2} -> ({:.1f}, {:.1f})   (и точка возврата)".format(
     start, start_x, start_y))
 print("цель   метка {:>2} -> ({:.1f}, {:.1f})".format(target, target_x, target_y))
