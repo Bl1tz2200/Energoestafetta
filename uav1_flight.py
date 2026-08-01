@@ -155,8 +155,16 @@ class MissionConfig:
     #   aruco-map — по позиции платформы, navigate() абсолютными координатами
     #               карты. Так летают соперники; требует, чтобы map1.txt на
     #               платформе совпадал с config/field_map.txt.
-    nav_mode: str = "markers"
+    nav_mode: str = "aruco-map"
     map_tolerance: float = 0.25  # «дошли» в режиме aruco-map, м
+    # Поиск, когда позиция пропала. По документации Clover телеметрия в кадре
+    # карты отдаёт NaN, если карта не распознавалась 0.5 с, — то есть «место
+    # неизвестно» это штатная ситуация, а не отказ. Сначала просто ждём (карта
+    # могла мигнуть), потом поднимаемся (шире обзор), потом обходим маленькую
+    # зону крестом с возвратом в исходную точку.
+    search_wait_s: float = 2.0
+    search_radius: float = 0.4  # плечо креста, м
+    search_rounds: int = 2  # сколько раз повторить крест
     node_name: str = "uav1_flight"
     quiet: bool = False
 
@@ -585,6 +593,48 @@ class Pilot:
             limit=self.config.alt_fix, dead_zone=self.config.alt_dead_zone,
         )
 
+    # ------------------------------------------------------- потеря позиции
+    def search_lost(self, probe: Callable[[], bool], what: str) -> bool:
+        """Найти позицию заново. True — нашли.
+
+        Порядок от безобидного к рискованному: подождать на месте, подняться
+        (обзор шире), обойти небольшую зону крестом с возвратом в исходную
+        точку. Крест выбран не для красоты: каждое плечо сразу компенсируется
+        обратным, поэтому дрон не уползает от места потери — а именно там,
+        по последним достоверным данным, он и находится в разрешённой зоне.
+        """
+        self.say("          {} — ищем: ждём на месте {:.1f} с".format(
+            what, self.config.search_wait_s))
+        deadline = self.config.search_wait_s
+        waited = 0.0
+        while waited < deadline:
+            self.sleep(self.config.frame_pause)
+            waited += self.config.frame_pause
+            if probe():
+                self.say("          нашлось без манёвров")
+                return True
+
+        while self.blind_up + self.config.look_up <= self.config.climb_max:
+            self.blind_up += self.config.look_up
+            self.after_blind_climb = True
+            self.say("          поднимаемся осмотреться (+{:.1f} м)".format(self.blind_up))
+            self.fly(0.0, 0.0, self.config.look_up, speed=self.config.climb_speed)
+            if probe():
+                self.say("          нашлось после подъёма")
+                return True
+
+        radius = self.config.search_radius
+        pattern = ((radius, 0.0), (-radius, 0.0), (0.0, radius), (0.0, -radius))
+        for round_number in range(1, self.config.search_rounds + 1):
+            for forward, left in pattern:
+                self.say("          обход зоны {}/{}: {:+.2f}, {:+.2f}".format(
+                    round_number, self.config.search_rounds, forward, left))
+                self.fly(forward, left, 0.0)
+                if probe():
+                    self.say("          нашлось при обходе зоны")
+                    return True
+        return False
+
     # ------------------------------------------------- перелёт по aruco_map
     def goto_map(self, target_id: int) -> bool:
         """Долететь до метки по позиции платформы. True — дошли.
@@ -603,9 +653,17 @@ class Pilot:
         for _ in range(self.config.tries):
             pose = self.read_map_pose()
             if pose is None:
-                raise FlightAborted(
-                    "aruco_map не отдаёт позицию — в режиме --nav-mode aruco-map "
-                    "лететь не по чему")
+                # Карта пропала из виду. По документации Clover телеметрия в её
+                # кадре отдаёт NaN уже после 0.5 с без распознавания, так что
+                # это ещё не отказ — сначала ищем.
+                if not self.search_lost(
+                        lambda: self.read_map_pose() is not None, "aruco_map молчит"):
+                    raise FlightAborted(
+                        "позиция по aruco_map не нашлась даже после поиска — "
+                        "проверьте ноду aruco_map, карту map1.txt и освещение")
+                pose = self.read_map_pose()
+                if pose is None:
+                    raise FlightAborted("позиция по aruco_map пропала снова")
             x, y = pose[0], pose[1]
             if not self.fence.contains(x, y):
                 raise FlightAborted(
@@ -675,9 +733,14 @@ class Pilot:
             if sight.base is None or sight.position is None:
                 empty_frames += 1
                 if empty_frames >= self.config.blind_frames:
-                    self.say("          в кадре {} — места не определить".format(
-                        "нет меток" if not sight.seen else "одна метка"))
-                    self.climb()
+                    def _seen() -> bool:
+                        found = self.look()
+                        return found is not None and found.position is not None
+
+                    if not self.search_lost(_seen, "в кадре меньше двух меток"):
+                        raise FlightAborted(
+                            "меток не нашлось даже после поиска — лететь по карте "
+                            "не от чего")
                     empty_frames = 0
                 else:
                     self.sleep(self.config.frame_pause)
@@ -998,26 +1061,56 @@ def _run_mission_by_map(pilot: Pilot, route: Sequence[int]) -> bool:
     карты. Взлёт и посадка на куб общие с основным режимом.
     """
     config = pilot.config
+    start_xy = nav.marker_xy(pilot.field, config.start_marker_id)
+
+    # На земле дрон стоит НА стартовой метке и закрывает её собой, а с высоты
+    # 10 см камера охватывает пятачок под собой — карты может не быть видно
+    # вовсе. Это норма, а не отказ: сверяемся после взлёта. Но если позиция
+    # всё-таки есть и она не та — взлетать нельзя, карта не совпадает с полем.
     pose = pilot.read_map_pose()
     if pose is None:
-        raise FlightAborted(
-            "aruco_map не отдаёт позицию ещё до взлёта — проверьте ноду и map1.txt "
-            "(README, «Подготовка окружения на борту»)")
-    start_xy = nav.marker_xy(pilot.field, config.start_marker_id)
-    error = math.hypot(pose[0] - start_xy[0], pose[1] - start_xy[1])
-    pilot.say(">>> НА ЗЕМЛЕ по aruco_map: ({:.2f}, {:.2f}), старт {} в ({:.2f}, {:.2f}), "
-              "расхождение {:.2f} м".format(
-                  pose[0], pose[1], config.start_marker_id, start_xy[0], start_xy[1], error))
-    if error > config.start_tolerance:
-        raise FlightAborted(
-            "на земле aruco_map показывает ({:.2f}, {:.2f}) вместо ({:.2f}, {:.2f}): "
-            "карта на платформе не совпадает с полем — взлетать нельзя".format(
-                pose[0], pose[1], start_xy[0], start_xy[1]))
+        pilot.say(">>> НА ЗЕМЛЕ карта не видна (дрон закрывает стартовую метку) — "
+                  "сверимся после взлёта")
+    else:
+        error = math.hypot(pose[0] - start_xy[0], pose[1] - start_xy[1])
+        pilot.say(">>> НА ЗЕМЛЕ по aruco_map: ({:.2f}, {:.2f}), старт {} в "
+                  "({:.2f}, {:.2f}), расхождение {:.2f} м".format(
+                      pose[0], pose[1], config.start_marker_id,
+                      start_xy[0], start_xy[1], error))
+        if error > config.start_tolerance:
+            raise FlightAborted(
+                "на земле aruco_map показывает ({:.2f}, {:.2f}) вместо ({:.2f}, "
+                "{:.2f}): карта на платформе не совпадает с полем — взлетать "
+                "нельзя".format(pose[0], pose[1], start_xy[0], start_xy[1]))
 
     pilot.say("ВЗЛЁТ на {:.2f} м (frame_id='body', auto_arm=True)".format(config.alt))
     pilot.fly(0.0, 0.0, config.alt, speed=config.climb_speed, auto_arm=True)
     pilot.armed = True
     pilot.sleep(config.settle_s)
+
+    # Главная сверка — уже в воздухе. Дрон, который не держит точку, уезжает
+    # именно на этих секундах, и лететь по маршруту от неверного места нельзя.
+    pose = pilot.read_map_pose()
+    if pose is None and pilot.search_lost(
+            lambda: pilot.read_map_pose() is not None, "после взлёта карта не видна"):
+        pose = pilot.read_map_pose()
+    if pose is None:
+        raise FlightAborted(
+            "после взлёта aruco_map не отдаёт позицию — проверьте ноду aruco_map, "
+            "карту map1.txt и освещение (README, «Подготовка окружения на борту»)")
+    error = math.hypot(pose[0] - start_xy[0], pose[1] - start_xy[1])
+    pilot.say(">>> ПОСЛЕ ВЗЛЁТА по aruco_map: ({:.2f}, {:.2f}, {:.2f}), старт {} в "
+              "({:.2f}, {:.2f}), расхождение {:.2f} м".format(
+                  pose[0], pose[1], pose[2], config.start_marker_id,
+                  start_xy[0], start_xy[1], error))
+    if error > config.start_tolerance:
+        raise FlightAborted(
+            "после взлёта дрон в ({:.2f}, {:.2f}), а стартовая метка {} — в "
+            "({:.2f}, {:.2f}): расхождение {:.2f} м больше --start-tolerance "
+            "{:.2f} м. Дрон не удержал точку — разбираться с оценкой положения "
+            "в PX4 (VPE), а не с флагами скрипта".format(
+                pose[0], pose[1], config.start_marker_id, start_xy[0], start_xy[1],
+                error, config.start_tolerance))
 
     for mid in route[:-1]:
         pilot.goto_map(mid)
@@ -1196,6 +1289,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "aruco-map — по позиции платформы, абсолютными точками")
     parser.add_argument("--map-tolerance", type=float, default=default.map_tolerance,
                         help="«дошли до узла» в режиме aruco-map, м")
+    parser.add_argument("--search-radius", type=float, default=default.search_radius,
+                        help="плечо креста при поиске потерянной позиции, м")
+    parser.add_argument("--search-rounds", type=int, default=default.search_rounds,
+                        help="сколько раз обойти зону крестом, прежде чем сдаться")
     parser.add_argument("--probe", action="store_true",
                         help="проверка зрения без моторов: что видно и каким будет маршрут")
     parser.add_argument("--quiet", action="store_true")
@@ -1241,6 +1338,8 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         rangefinder_topic=args.rangefinder_topic,
         nav_mode=args.nav_mode,
         map_tolerance=args.map_tolerance,
+        search_radius=args.search_radius,
+        search_rounds=args.search_rounds,
         quiet=args.quiet,
     )
 
