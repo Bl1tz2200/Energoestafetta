@@ -65,19 +65,38 @@ class MissionConfig:
     # именно он держит дрон на маршруте, проходящем вплотную вдоль ствола
     # (см. tree_clearance). Потолок полётной зоны по регламенту — 4 м.
     alt: float = 2.0
-    speed: float = 0.5  # горизонтальная скорость, м/с
-    climb_speed: float = 0.3  # набор высоты медленнее — взлёт мягче
-    descent_speed: float = 0.25
+    speed: float = 0.3  # горизонтальная скорость, м/с
+    climb_speed: float = 0.2  # набор высоты медленнее — взлёт мягче
+    descent_speed: float = 0.2
+
+    # ── Плавность хода ──────────────────────────────────────────────────
+    # Резкость полёта задаётся не скоростью, а ДЛИНОЙ одной команды.
+    # ``navigate(frame_id='body')`` мгновенно ставит цель на step_length
+    # вперёд, и контроллер PX4 отрабатывает эту ошибку положения наклоном:
+    # чем длиннее шаг, тем больше наклон и тем сильнее разгон. Поэтому
+    # уменьшение ``speed`` само по себе рывки не убирает — нужно уменьшать шаг.
+    step_length: float = 0.3  # максимум одной горизонтальной команды, м
+    climb_step: float = 0.5  # максимум одной вертикальной команды, м
+    # После каждого шага цель ставится в текущую точку (navigate(0,0,0,body)):
+    # это гасит остаточную скорость, и следующий кадр снимается с неподвижного
+    # дрона. Без торможения команды складываются с инерцией — дрон
+    # разгоняется от шага к шагу и проскакивает цель.
+    brake_pause: float = 0.6  # пауза на гашение скорости после шага, с
+    settle_after_hop: bool = True  # ждать спокойного кадра после каждого шага
 
     marker_size: float = 0.33  # сторона метки, м — по ней кадр переводится в метры
     aruco_dict: str = "DICT_4X4_50"
-    gain: float = 0.7  # какую долю промаха отрабатывать за раз
+    gain: float = 0.5  # какую долю промаха отрабатывать за раз
     tol: float = 0.08  # «над меткой»: доля диагонали кадра
-    tries: int = 10  # попыток довести дрон до одного узла
-    hop_pad: float = 0.8  # запас к паузе перелёта на разгон/торможение, с
+    tries: int = 16  # попыток довести дрон до одного узла (шаг короткий — их больше)
+    # Запас к паузе перелёта, с. Меньше, чем был раньше, потому что после шага
+    # теперь идёт явное торможение и ожидание спокойного кадра: если дрон не
+    # успел дойти, торможение просто остановит его раньше, а недоделанное
+    # доберёт следующий шаг — контур замкнут по меткам.
+    hop_pad: float = 0.5
     hop_max_steps: float = 1.5  # длиннее этого (в шагах решётки) команд не бывает
     hop_dead_zone: float = 0.05  # мельче — не команда, а шум опознания метки
-    alt_fix: float = 0.3  # предел поправки высоты за одну команду, м
+    alt_fix: float = 0.25  # предел поправки высоты за одну команду, м
     alt_dead_zone: float = 0.07
 
     look_up: float = 0.3  # подъём «осмотреться», если меток не видно, м
@@ -128,7 +147,9 @@ class MissionConfig:
     quiet: bool = False
 
     def hop_limit(self, grid_step: float) -> float:
-        return self.hop_max_steps * grid_step
+        """Длина одной горизонтальной команды: короткий шаг ради плавности,
+        но не длиннее аварийного предела в шагах решётки."""
+        return min(self.step_length, self.hop_max_steps * grid_step)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -244,7 +265,7 @@ class Pilot:
 
     # ------------------------------------------------------------ команда
     def hop(self, axis: str, value: float, *, speed: Optional[float] = None,
-            auto_arm: bool = False) -> None:
+            auto_arm: bool = False, brake: bool = True) -> None:
         """ЕДИНСТВЕННОЕ место, откуда уходит navigate(): ровно одна ось.
 
         Две другие координаты всегда нули, ``frame_id='body'``. ``yaw`` не
@@ -283,14 +304,27 @@ class Pilot:
 
         self.sleep(abs(float(value)) / max(speed, 0.05) + self.config.hop_pad)
 
-    def hold(self) -> None:
-        """Аварийный стоп: «цель — там, где я сейчас». Все три координаты нули."""
-        self.say("          стоп: navigate(0, 0, 0, frame_id='body')")
+        # Торможение: цель переносится в текущую точку, остаточная скорость
+        # гасится, и следующая команда начинается с неподвижного дрона. Без
+        # этого шаги складываются с инерцией — дрон разгоняется от шага к шагу,
+        # проскакивает цель и «плывёт» дальше, чем ему было велено.
+        if brake:
+            self._stop_moving()
+            self.sleep(self.config.brake_pause)
+
+    def _stop_moving(self, *, speed: Optional[float] = None) -> None:
+        """``navigate(0, 0, 0, frame_id='body')`` — «цель там, где я сейчас»."""
         try:
-            self.ros.navigate(x=0.0, y=0.0, z=0.0, speed=self.config.descent_speed,
+            self.ros.navigate(x=0.0, y=0.0, z=0.0,
+                              speed=float(speed if speed is not None else self.config.speed),
                               frame_id="body", auto_arm=False)
         except Exception as exc:  # noqa: BLE001 - гасить движение пробуем до конца
             self.say("          стоп не прошёл: {}".format(exc))
+
+    def hold(self) -> None:
+        """Аварийный стоп: «цель — там, где я сейчас». Все три координаты нули."""
+        self.say("          стоп: navigate(0, 0, 0, frame_id='body')")
+        self._stop_moving(speed=self.config.descent_speed)
 
     # -------------------------------------------------------------- зрение
     def look(self) -> Optional[Sight]:
@@ -331,16 +365,25 @@ class Pilot:
                 self.blind_up = max(0.0, sight.altitude - self.config.alt)
         return sight
 
-    def settle(self) -> float:
+    def settle(self, *, frames: Optional[int] = None, tries: Optional[int] = None,
+               verbose: bool = True) -> float:
         """Дождаться спокойного висения; вернуть сторону метки на тихом кадре.
 
-        Доводка по прыгающей в кадре метке раскачивает дрон сильнее, чем
-        исправляет, поэтому команд до успокоения не отдаём вовсе.
+        Признак того, что дрон перестал качать, — метка под ним стоит в кадре:
+        между соседними кадрами её центр и размер почти не меняются. Доводка
+        по прыгающей метке раскачивает дрон сильнее, чем исправляет, поэтому
+        команд до успокоения не отдаём вовсе.
+
+        ``frames``/``tries`` позволяют коротко перевести дух после каждого
+        шага (два спокойных кадра), не тратя полное ожидание, которое нужно
+        только на калибровке и перед спуском на куб.
         """
+        frames = self.config.settle_frames if frames is None else frames
+        tries = self.config.settle_tries if tries is None else tries
         previous: Optional[Tuple[int, Tuple[float, float, float]]] = None
         calm = 0
         side = 0.0
-        for _ in range(self.config.settle_tries):
+        for _ in range(tries):
             sight = self.look()
             if sight is None or sight.base is None:
                 previous, calm = None, 0
@@ -355,16 +398,18 @@ class Pilot:
                 zoom = abs(side - pside) / side
                 if drift < self.config.settle_drift and zoom < self.config.settle_drift:
                     calm += 1
-                    if calm >= self.config.settle_frames:
-                        self.say("          висим спокойно (метка {}, {:.0f} px)".format(
-                            base.mid, side))
+                    if calm >= frames:
+                        if verbose:
+                            self.say("          висим спокойно (метка {}, {:.0f} px)".format(
+                                base.mid, side))
                         return side
                 else:
                     calm = 0
             previous = (base.mid, (base.x, base.y, side))
             self.sleep(self.config.frame_pause)
 
-        self.say("          успокоиться не вышло — летим как есть")
+        if verbose:
+            self.say("          успокоиться не вышло — летим как есть")
         return side
 
     # -------------------------------------------------------------- сторожа
@@ -552,6 +597,10 @@ class Pilot:
                 self.say("          перелёт {:.2f} м урезан до {:.2f} м по оси {}".format(
                     abs(raw), abs(hop.value), hop.axis))
             self.hop(hop.axis, hop.value)
+            if self.config.settle_after_hop:
+                # Следующий кадр должен сниматься с неподвижного дрона: иначе
+                # поправка считается по смазанной картинке и уходит в раскачку.
+                self.settle(frames=2, tries=6, verbose=False)
             self.after_blind_climb = False
             moves += 1
 
@@ -569,9 +618,18 @@ class Pilot:
     # -------------------------------------------------------------- взлёт
     def takeoff(self) -> None:
         """Вертикальный взлёт на рабочую высоту и калибровка по спокойному кадру."""
-        self.say("взлёт на {:.2f} м (frame_id='body', auto_arm=True)".format(self.config.alt))
-        self.hop("z", self.config.alt, speed=self.config.climb_speed, auto_arm=True)
-        self.armed = True
+        # Взлёт тоже порциями: команда «сразу на 2 м» — это скачок ошибки
+        # положения на два метра, который PX4 отрабатывает рывком вверх.
+        self.say("взлёт на {:.2f} м шагами по {:.2f} м (frame_id='body')".format(
+            self.config.alt, self.config.climb_step))
+        remaining = self.config.alt
+        first = True
+        while remaining > 1e-3:
+            step = min(self.config.climb_step, remaining)
+            self.hop("z", step, speed=self.config.climb_speed, auto_arm=first)
+            self.armed = True
+            first = False
+            remaining -= step
 
         side = self.settle()
         if side <= 1.0:
@@ -839,6 +897,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="допуск сверки места со стартовой меткой после взлёта, м")
     parser.add_argument("--hop-pad", type=float, default=default.hop_pad)
     parser.add_argument("--hop-max-steps", type=float, default=default.hop_max_steps)
+    parser.add_argument("--step-length", type=float, default=default.step_length,
+                        help="максимум одной горизонтальной команды, м — главный "
+                             "регулятор плавности: короче шаг, меньше наклон и рывок")
+    parser.add_argument("--climb-step", type=float, default=default.climb_step,
+                        help="максимум одной вертикальной команды, м")
+    parser.add_argument("--brake-pause", type=float, default=default.brake_pause,
+                        help="пауза на гашение скорости после каждого шага, с")
+    parser.add_argument("--no-settle-after-hop", dest="settle_after_hop",
+                        action="store_false",
+                        help="не ждать спокойного кадра после каждого шага (быстрее, "
+                             "но поправки считаются по смазанной картинке)")
     parser.add_argument("--alt-fix", type=float, default=default.alt_fix)
     parser.add_argument("--station-height", type=float, default=default.station_height)
     parser.add_argument("--descent-step", type=float, default=default.descent_step)
@@ -880,6 +949,10 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         tries=args.tries,
         hop_pad=args.hop_pad,
         hop_max_steps=args.hop_max_steps,
+        step_length=args.step_length,
+        climb_step=args.climb_step,
+        brake_pause=args.brake_pause,
+        settle_after_hop=args.settle_after_hop,
         alt_fix=args.alt_fix,
         station_height=args.station_height,
         descent_step=args.descent_step,
