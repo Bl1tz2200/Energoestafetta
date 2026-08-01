@@ -183,9 +183,15 @@ def segment_is_clear(
     trees: Sequence[Tuple[float, float]],
     clearance: float,
 ) -> bool:
-    """Отрезок проходит не ближе ``clearance`` к каждому стволу."""
+    """Отрезок проходит не ближе ``clearance`` к каждому стволу.
+
+    Сравнение с допуском в микрон: типовые зазоры на решётке — ровно половина
+    шага (0.5 м), и зазор по умолчанию задан таким же. Строгое сравнение
+    сделало бы допустимость такого прохода зависящей от последнего бита
+    арифметики с плавающей точкой, то есть от координат в карте поля.
+    """
     return all(
-        point_to_segment(tx, ty, start[0], start[1], end[0], end[1]) >= clearance
+        point_to_segment(tx, ty, start[0], start[1], end[0], end[1]) >= clearance - 1e-6
         for tx, ty in trees
     )
 
@@ -196,16 +202,20 @@ def plan_route(
     goal_id: int,
     *,
     trees: Sequence[Tuple[float, float]] = (),
-    clearance: float = 0.8,
+    clearance: float = 0.5,
     step: Optional[float] = None,
 ) -> List[int]:
     """Кратчайший путь по решётке меток в обход деревьев: список ID без стартового.
 
     Рёбра — только соседние метки по осям (никаких диагоналей: команда полёта
     и так отдаётся по одной оси). Ребро отбрасывается, если проходит ближе
-    ``clearance`` к любому стволу; деревья стоят в углах ячеек, поэтому
-    запрещёнными оказываются ровно четыре ребра вокруг каждого, а оставшийся
-    маршрут проходит от ствола не ближе ~0.71 шага.
+    ``clearance`` к любому стволу.
+
+    Деревья стоят в углах ячеек, поэтому зазор до ствола у рёбер решётки
+    принимает всего несколько значений: 0.5 шага у четырёх рёбер, идущих
+    вплотную вдоль дерева, ~0.71 у соседних с ними и дальше. Отсюда и смысл
+    ``clearance``: 0.5 разрешает проход вплотную (маршрут короче), всё, что
+    больше, отбрасывает эти четыре ребра и уводит маршрут на ячейку в сторону.
     """
     if start_id == goal_id:
         return []
@@ -597,23 +607,28 @@ def _self_test() -> None:
     trees = tree_positions(field)
     assert trees[0] == (5.5, 1.5), trees[0]
     assert set(trees) == {(5.5, 1.5), (3.5, 5.5), (2.5, 1.5), (0.5, 4.5)}
-    assert tree_hit(5.6, 1.6, trees, 0.8) == (5.5, 1.5)
-    assert tree_hit(3.0, 3.0, trees, 0.8) is None
+    assert tree_hit(5.6, 1.6, trees, 0.5) == (5.5, 1.5)
+    assert tree_hit(3.0, 3.0, trees, 0.5) is None
 
-    # Прямая «старт -> станция» проходит вплотную к дереву (5.5, 1.5) — ради
-    # этого и нужен обход; маршрут по решётке от всех стволов держится далеко.
-    assert not segment_is_clear((6.0, 6.0), (5.0, 0.0), trees, 0.8)
-    route = plan_route(field, 48, 5, trees=trees, clearance=0.8)
-    assert route[-1] == 5, route
-    previous = marker_xy(field, 48)
-    for mid in route:
-        current = marker_xy(field, mid)
-        moved = (abs(current[0] - previous[0]), abs(current[1] - previous[1]))
-        assert abs(moved[0] + moved[1] - 1.0) < 1e-9 and min(moved) < 1e-9, (mid, moved)
-        assert segment_is_clear(previous, current, trees, 0.8), mid
-        previous = current
-    # Без деревьев тот же маршрут — кратчайший манхэттенский (1 + 6 шагов).
-    assert len(plan_route(field, 48, 5, trees=(), clearance=0.8)) == 7
+    # Прямая «старт -> станция» проходит в 0.25 м от дерева (5.5, 1.5) — ради
+    # этого и нужен маршрут по решётке, где зазор до ствола не меньше половины
+    # ячейки.
+    assert not segment_is_clear((6.0, 6.0), (5.0, 0.0), trees, 0.5)
+
+    for clearance, expected in ((0.5, 7), (0.8, 9)):
+        route = plan_route(field, 48, 5, trees=trees, clearance=clearance)
+        assert route[-1] == 5, route
+        assert len(route) == expected, (clearance, route)
+        previous = marker_xy(field, 48)
+        for mid in route:
+            current = marker_xy(field, mid)
+            moved = (abs(current[0] - previous[0]), abs(current[1] - previous[1]))
+            assert abs(moved[0] + moved[1] - 1.0) < 1e-9 and min(moved) < 1e-9, (mid, moved)
+            assert segment_is_clear(previous, current, trees, clearance), (clearance, mid)
+            previous = current
+    # Зазор по умолчанию (0.5) пускает дрон вплотную вдоль ствола — маршрут
+    # получается кратчайшим манхэттенским, как если бы деревьев не было.
+    assert len(plan_route(field, 48, 5, trees=(), clearance=0.5)) == 7
     try:
         plan_route(field, 48, 5, trees=trees, clearance=5.0)
     except NavigationError:
@@ -678,7 +693,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--map", default="config/field_map.txt", help="карта поля")
     parser.add_argument("--start-marker", type=int, default=48)
     parser.add_argument("--station-marker", type=int, default=5)
-    parser.add_argument("--tree-clearance", type=float, default=0.8)
+    parser.add_argument("--tree-clearance", type=float, default=0.5)
     args = parser.parse_args(argv)
 
     if args.self_test:

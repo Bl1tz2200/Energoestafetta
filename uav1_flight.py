@@ -95,7 +95,19 @@ class MissionConfig:
 
     tree_groups: Tuple[Tuple[int, ...], ...] = nav.DEFAULT_TREE_GROUPS
     tree_height: float = 1.0
-    tree_clearance: float = 0.8
+    # Зазор для ПЛАНИРОВАНИЯ маршрута. 0.5 м — ровно половина ячейки, то есть
+    # проход вплотную вдоль ствола (ребро решётки, соседнее с деревом, отстоит
+    # от него ровно на 0.5 м). Такой маршрут короче на два перегона; запас по
+    # вертикали при этом обеспечивает alt - tree_height.
+    tree_clearance: float = 0.5
+    # Зазор для СТОРОЖА: ближе этого к стволу лететь нельзя ни при каких
+    # обстоятельствах — команда отменяется, миссия прерывается. Он заметно
+    # меньше планового не по небрежности: команда идёт по осям корпуса, а
+    # маршрут проложен по осям поля, поэтому фактический перегон у
+    # развёрнутого дрона всегда немного отходит от идеального ребра решётки.
+    # Если сторож требует того же, что планировщик, эти законные отклонения
+    # он принимает за опасность и сажает дрон посреди исправного полёта.
+    tree_guard_clearance: float = 0.3
     tree_vertical_margin: float = 0.4
     geofence_margin: float = 0.5
 
@@ -347,10 +359,10 @@ class Pilot:
             raise FlightAborted(
                 "дрон вне поля: ({:.2f}, {:.2f}), разрешено {}".format(
                     x, y, self.fence.describe()))
-        tree = nav.tree_hit(x, y, self.trees, self.config.tree_clearance)
+        tree = nav.tree_hit(x, y, self.trees, self.config.tree_guard_clearance)
         if tree is not None:
             raise FlightAborted(
-                "дрон над деревом ({:.1f}, {:.1f}) — расходимся".format(*tree))
+                "дрон вплотную к дереву ({:.1f}, {:.1f}) — расходимся".format(*tree))
 
     def hop_danger(self, sight: Sight, hop: nav.Hop) -> Optional[str]:
         """Чем опасен этот перелёт, или None, если он безопасен.
@@ -369,7 +381,7 @@ class Pilot:
         if not self.fence.contains(*end):
             return "вывел бы за поле: ({:.2f}, {:.2f})".format(*end)
         if not nav.segment_is_clear(sight.position, end, self.trees,
-                                    self.config.tree_clearance):
+                                    self.config.tree_guard_clearance):
             return "прошёл бы вплотную к дереву"
         return None
 
@@ -656,6 +668,13 @@ def run_mission(pilot: Pilot) -> bool:
         raise FlightAborted(
             "рабочая высота {:.2f} м опасно близка к деревьям {:.2f} м — "
             "поднимите --alt".format(config.alt, config.tree_height))
+    if config.tree_guard_clearance > config.tree_clearance:
+        # Иначе сторож запретит ровно тот маршрут, который сам же планировщик
+        # и построил, — дрон сядет посреди исправного полёта.
+        raise FlightAborted(
+            "--tree-guard-clearance ({:.2f} м) больше --tree-clearance ({:.2f} м): "
+            "сторож запретит спланированный маршрут".format(
+                config.tree_guard_clearance, config.tree_clearance))
 
     pilot.takeoff()
 
@@ -766,7 +785,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="метки, в общем углу которых стоит дерево (флаг повторяемый; "
                              "'none' — деревьев нет)")
     parser.add_argument("--tree-height", type=float, default=default.tree_height)
-    parser.add_argument("--tree-clearance", type=float, default=default.tree_clearance)
+    parser.add_argument("--tree-clearance", type=float, default=default.tree_clearance,
+                        help="зазор до ствола при построении маршрута, м")
+    parser.add_argument("--tree-guard-clearance", type=float,
+                        default=default.tree_guard_clearance,
+                        help="ближе этого к стволу лететь нельзя: команда отменяется, "
+                             "миссия прерывается (должен быть не больше --tree-clearance)")
     parser.add_argument("--tree-vertical-margin", type=float,
                         default=default.tree_vertical_margin)
     parser.add_argument("--geofence-margin", type=float, default=default.geofence_margin)
@@ -801,6 +825,7 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         tree_groups=_parse_tree_groups(args.tree_markers),
         tree_height=args.tree_height,
         tree_clearance=args.tree_clearance,
+        tree_guard_clearance=args.tree_guard_clearance,
         tree_vertical_margin=args.tree_vertical_margin,
         geofence_margin=args.geofence_margin,
         camera_topic=args.camera_topic,
