@@ -61,7 +61,10 @@ class MissionConfig:
     start_marker_id: int = 48
     station_marker_id: int = 5
 
-    alt: float = 1.5  # рабочая высота, м (деревья 1 м, потолок зоны 4 м)
+    # Рабочая высота, м. 2.0 при деревьях 1 м даёт метр запаса над кроной —
+    # именно он держит дрон на маршруте, проходящем вплотную вдоль ствола
+    # (см. tree_clearance). Потолок полётной зоны по регламенту — 4 м.
+    alt: float = 2.0
     speed: float = 0.5  # горизонтальная скорость, м/с
     climb_speed: float = 0.3  # набор высоты медленнее — взлёт мягче
     descent_speed: float = 0.25
@@ -85,8 +88,14 @@ class MissionConfig:
     settle_tries: int = 20
     frame_pause: float = 0.3  # пауза между кадрами в циклах ожидания, с
 
-    blind_tolerance: float = 0.15  # доводка на закрытую кубом метку станции, м
+    blind_tolerance: float = 0.15  # доводка на закрытую метку по карте, м
     blind_confirm: int = 3  # столько кадров подряд остаток должен быть мал
+    # Метки, физически закрытые объектами: площадка «Н» на старте, кубы
+    # зарядных станций, груз. Камера их не увидит никогда, поэтому вставать
+    # над ними можно только счётом по карте от соседей, а сверять положение —
+    # по координатам, а не по «вижу нужную метку».
+    blind_markers: Tuple[int, ...] = (0, 5, 37, 48)
+    start_tolerance: float = 0.7  # допуск сверки места со стартовой меткой, м
 
     station_height: float = 0.8  # высота куба станции, м
     descent_step: float = 0.15
@@ -218,7 +227,11 @@ class Pilot:
         self.fence = nav.Geofence.from_field(field, margin=config.geofence_margin)
 
         self.side_ref = 0.0  # сторона метки на рабочей высоте (эталон высоты)
-        self.yaw_ref = 0.0  # последний измеренный поворот поля в кадре
+        # Последний ИЗМЕРЕННЫЙ поворот поля в кадре. None означает «ещё ни разу
+        # не измеряли»: по одной метке в кадре поворот не определить, а
+        # подставить вместо него ноль — значит развернуть все расчёты места на
+        # неизвестный угол. Пока здесь None, места дрон не знает и не летит.
+        self.yaw_ref: Optional[float] = None
         self.blind_up = 0.0  # набрано вслепую сверх рабочей высоты, м
         self.after_blind_climb = False  # см. hold_altitude: запрет сразу отдать высоту
         self.nav_fails = 0
@@ -298,11 +311,16 @@ class Pilot:
             return sight
 
         sight.base = nav.nearest_to_centre(seen, centre)
+        # Поворот поля меряется по ПАРЕ меток; одной метки для этого мало.
+        # Если пары в кадре нет, берём последний измеренный угол — курс дрон
+        # нигде не меняет (команд по yaw в коде нет), поэтому он не «протухает».
+        # А вот если не измеряли ещё ни разу, места мы не знаем — так и
+        # оставляем, чтобы не полететь по развёрнутой на неизвестный угол карте.
         measured_yaw = nav.frame_yaw_from_pairs(seen, self.field, self.config.marker_size)
         if measured_yaw is not None:
             self.yaw_ref = measured_yaw
         sight.frame_yaw = self.yaw_ref
-        if sight.base is not None and sight.base.mid in self.field:
+        if sight.frame_yaw is not None and sight.base is not None and sight.base.mid in self.field:
             sight.position = nav.estimate_position(
                 sight.base, self.field, self.yaw_ref, centre, self.config.marker_size
             )
@@ -471,9 +489,14 @@ class Pilot:
             if sight is None:
                 self.sleep(self.config.frame_pause)
                 continue
-            if not sight.seen or sight.base is None:
+            # Меток нет вовсе или их слишком мало, чтобы знать своё место
+            # (поворот поля меряется по паре меток) — лечится одним и тем же:
+            # подняться и расширить обзор.
+            if sight.base is None or sight.position is None:
                 empty_frames += 1
                 if empty_frames >= self.config.blind_frames:
+                    self.say("          в кадре {} — места не определить".format(
+                        "нет меток" if not sight.seen else "одна метка"))
                     self.climb()
                     empty_frames = 0
                 else:
@@ -561,16 +584,40 @@ class Pilot:
         self.say(">>> ВЫСОТА {:.2f} м = метка {:.0f} px в кадре (эталон)".format(
             self.config.alt, side))
 
+        # Место определяется по паре меток: одной мало (по ней не измерить
+        # поворот поля). В углу поля, где стартовая метка закрыта площадкой,
+        # пары в кадре может не оказаться — тогда поднимаемся и расширяем обзор.
         sight = self.look()
-        if sight is None or sight.base is None:
-            raise FlightAborted("после взлёта кадр без меток — миссию не начинаем")
-        self.say(">>> СТАРТОВАЯ МЕТКА: {} (видно: {})".format(
-            sight.base.mid, " ".join(str(mid) for mid in sorted(sight.seen))))
-        if sight.base.mid != self.config.start_marker_id:
+        while sight is None or sight.position is None:
+            self.say("          места не определить — нужны две метки в кадре")
+            before = self.blind_up
+            self.climb()
+            if self.blind_up == before:  # выше подниматься уже нельзя
+                raise FlightAborted(
+                    "после взлёта в кадре меньше двух меток — поворот поля не "
+                    "измерить, лететь по карте нельзя")
+            sight = self.look()
+
+        # Стартовую метку дрон НЕ увидит: её закрывает площадка «Н», как куб
+        # закрывает метку станции. Поэтому сверяем не «что под дроном», а
+        # расчётное место по окрестным меткам с координатами стартовой метки
+        # по карте: это ловит и не ту раскладку, и не ту площадку, и грубую
+        # ошибку опознания, но не требует видеть то, чего не видно.
+        start_xy = nav.marker_xy(self.field, self.config.start_marker_id)
+        error = math.hypot(sight.position[0] - start_xy[0], sight.position[1] - start_xy[1])
+        self.say(
+            ">>> ПОСЛЕ ВЗЛЁТА: место ({:.2f}, {:.2f}), старт {} в ({:.2f}, {:.2f}), "
+            "расхождение {:.2f} м | видно: {}".format(
+                sight.position[0], sight.position[1], self.config.start_marker_id,
+                start_xy[0], start_xy[1], error,
+                " ".join(str(mid) for mid in sorted(sight.seen))))
+        if error > self.config.start_tolerance:
             raise FlightAborted(
-                "под дроном метка {}, а ожидалась стартовая {} — "
-                "либо дрон стоит не там, либо карта не та".format(
-                    sight.base.mid, self.config.start_marker_id))
+                "после взлёта дрон в ({:.2f}, {:.2f}), а стартовая метка {} — "
+                "в ({:.2f}, {:.2f}): расхождение {:.2f} м больше "
+                "--start-tolerance {:.2f} м".format(
+                    sight.position[0], sight.position[1], self.config.start_marker_id,
+                    start_xy[0], start_xy[1], error, self.config.start_tolerance))
 
         measured = nav.measured_grid_step(sight.seen, self.field, self.config.marker_size)
         if measured:
@@ -679,7 +726,10 @@ def run_mission(pilot: Pilot) -> bool:
     pilot.takeoff()
 
     for mid in route[:-1]:
-        pilot.goto(mid)  # пропущенный узел не срывает миссию — идём дальше
+        # Узел, закрытый объектом (площадка, куб, груз), камера не увидит —
+        # над ним встаём счётом по карте от соседей, иначе дрон впустую
+        # выработал бы все попытки, ожидая метку, которой в кадре не будет.
+        pilot.goto(mid, blind=mid in config.blind_markers)
 
     station = route[-1] if route else config.station_marker_id
     pilot.say("подход к станции (метка {} закрыта кубом, наводимся по карте)".format(station))
@@ -758,6 +808,12 @@ def _parse_tree_groups(values: Optional[Sequence[str]]) -> Tuple[Tuple[int, ...]
     return tuple(groups)
 
 
+def _parse_blind_markers(value: Optional[str]) -> Tuple[int, ...]:
+    if value is None or value.strip().lower() in ("", "none"):
+        return ()
+    return tuple(int(part) for part in value.replace(";", ",").split(",") if part.strip())
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="БВС-1: перелёт к зарядной станции строго по ArUco-меткам")
@@ -775,6 +831,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gain", type=float, default=default.gain)
     parser.add_argument("--tol", type=float, default=default.tol)
     parser.add_argument("--tries", type=int, default=default.tries)
+    parser.add_argument("--blind-markers",
+                        default=",".join(str(mid) for mid in default.blind_markers),
+                        help="метки, физически закрытые объектами (площадка, кубы "
+                             "станций, груз) — их камера не видит никогда; 'none' — нет таких")
+    parser.add_argument("--start-tolerance", type=float, default=default.start_tolerance,
+                        help="допуск сверки места со стартовой меткой после взлёта, м")
     parser.add_argument("--hop-pad", type=float, default=default.hop_pad)
     parser.add_argument("--hop-max-steps", type=float, default=default.hop_max_steps)
     parser.add_argument("--alt-fix", type=float, default=default.alt_fix)
@@ -824,6 +886,8 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         touchdown_range=args.touchdown_range,
         tree_groups=_parse_tree_groups(args.tree_markers),
         tree_height=args.tree_height,
+        blind_markers=_parse_blind_markers(args.blind_markers),
+        start_tolerance=args.start_tolerance,
         tree_clearance=args.tree_clearance,
         tree_guard_clearance=args.tree_guard_clearance,
         tree_vertical_margin=args.tree_vertical_margin,
