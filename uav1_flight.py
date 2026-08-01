@@ -83,6 +83,14 @@ class MissionConfig:
     alt_dead_zone: float = 0.05
     settle_s: float = 3.0  # запас на успокоение сверх времени набора высоты, с
 
+    # Смягчение перелёта: 0 — как в fly_head, вся дистанция одной командой.
+    # Больше нуля — та же дистанция уходит лесенкой команд по micro_step через
+    # micro_pause, то есть цель всё время держится в нескольких сантиметрах
+    # впереди дрона и ошибка положения не успевает вырасти. Нужно, если
+    # прошивка игнорирует аргумент speed и отрабатывает скачок цели рывком.
+    micro_step: float = 0.0
+    micro_pause: float = 0.3
+
     look_up: float = 0.3  # подъём «осмотреться», если меток не видно, м
     climb_max: float = 1.0  # выше рабочей высоты вслепую не подниматься, м
     blind_frames: int = 2  # столько пустых кадров подряд — и поднимаемся
@@ -276,8 +284,29 @@ class Pilot:
             forward, left = forward * limit / distance, left * limit / distance
             distance = limit
 
+        if self.config.micro_step > 0.0:
+            self._fly_ramped(forward, left, up, speed, auto_arm)
+            return
+
         self._navigate_once(forward, left, up, speed, auto_arm)
         self.sleep(math.hypot(distance, up) / max(speed, 0.05) + self.config.hop_pad)
+
+    def _fly_ramped(self, forward: float, left: float, up: float,
+                    speed: float, auto_arm: bool) -> None:
+        """Та же дистанция, но лесенкой команд по ``micro_step``.
+
+        Смягчение на случай, если прошивка отрабатывает скачок цели рывком:
+        цель уходит вперёд понемногу, ошибка положения не успевает вырасти, а
+        фактическая скорость получается ``micro_step / micro_pause`` и не
+        зависит от того, как сборка понимает аргумент ``speed``.
+        """
+        total = math.hypot(math.hypot(forward, left), up)
+        pieces = max(1, int(math.ceil(total / self.config.micro_step)))
+        for index in range(pieces):
+            self._navigate_once(forward / pieces, left / pieces, up / pieces,
+                                speed, auto_arm and index == 0)
+            self.sleep(self.config.micro_pause)
+        self.sleep(self.config.hop_pad)
 
     def _navigate_once(self, forward: float, left: float, up: float,
                        speed: float, auto_arm: bool) -> None:
@@ -893,6 +922,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hop-max-steps", type=float, default=default.hop_max_steps)
     parser.add_argument("--alt-fix", type=float, default=default.alt_fix,
                         help="предел поправки высоты за одну команду, м")
+    parser.add_argument("--micro-step", type=float, default=default.micro_step,
+                        help="смягчение: дробить перелёт на команды по столько метров "
+                             "(0 — одной командой, как в fly_head; 0.06 — мягко)")
+    parser.add_argument("--micro-pause", type=float, default=default.micro_pause,
+                        help="пауза между дроблёными командами, с; вместе с "
+                             "--micro-step задаёт фактическую скорость")
     parser.add_argument("--station-height", type=float, default=default.station_height)
     parser.add_argument("--descent-step", type=float, default=default.descent_step)
     parser.add_argument("--touchdown-range", type=float, default=default.touchdown_range)
@@ -934,6 +969,8 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         hop_pad=args.hop_pad,
         hop_max_steps=args.hop_max_steps,
         alt_fix=args.alt_fix,
+        micro_step=args.micro_step,
+        micro_pause=args.micro_pause,
         station_height=args.station_height,
         descent_step=args.descent_step,
         touchdown_range=args.touchdown_range,
