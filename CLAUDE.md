@@ -22,8 +22,8 @@ Code).
 
 ## Структура репозитория
 
-В корне — только то, что запускают напрямую (`uav1_flight.py` на дроне) и
-этот README; общие модули — в `lib/`, карта поля — в `config/`,
+В корне — только то, что запускают напрямую (`uav1_flight.py` на дроне,
+`debug_axes.py`/`debug_camera.py` для отладки без моторов) и этот README; общие модули — в `lib/`, карта поля — в `config/`,
 регламент/план — в `docs/`. `CLAUDE.md` — по конвенции Claude Code остаётся в
 корне (иначе не подхватывается автоматически), даже несмотря на то что это не
 «файл запуска» — исключение из общего правила.
@@ -61,6 +61,8 @@ Code).
 ```bash
 python3 lib/marker_nav.py --self-test
 python3 lib/led_interface.py --self-test
+python3 debug_axes.py --self-test      # логика диагноза осей
+python3 debug_camera.py --self-test    # разбор кадра и сравнение с платформой
 ```
 
 `lib/marker_nav.py` без флага (`python3 lib/marker_nav.py --map ...`) печатает
