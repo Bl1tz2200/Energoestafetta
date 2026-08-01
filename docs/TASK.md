@@ -164,13 +164,10 @@ OpenCV; актуальность Zadig/Cfclient/RobboScratch стоит уточ
 
 ## Уже реализовано
 
+В ветке `UAV1` оставлено только то, что относится к БВС-1:
+
 - `lib/led_interface.py` — `set_led(pattern, color)`, backend
   `use_technic_ros1_backend()` (сервисы `led/set_effect`/`led/set_leds`).
-- `lib/gripper_control.py` — `gripper_open()`/`gripper_close()`, backend
-  `use_technic_gpio_gripper()` (утилита `gpio` на Orange Pi, без ROS).
-- `lib/energy_relay_vision.py` — `StationVision` (HSV-детектор цвета станции +
-  опциональный ArUco) и `TechnicROS1Vision` (кадр с `main_camera/image_raw`
-  через `cv_bridge`).
 - `config/field_map.txt` — карта поля 7×7 в формате `aruco_pose`
   (`id size x y z rot_z rot_y rot_x`), нумерация от левого верхнего угла.
 - `lib/marker_nav.py` — расчётная часть полёта по видимым меткам без ROS:
@@ -184,9 +181,14 @@ OpenCV; актуальность Zadig/Cfclient/RobboScratch стоит уточ
   по одной оси. Зарядка, LED-индикация, возврат и связь со станцией (шаги 2–7
   алгоритма) — ещё не реализованы.
 
-Прежнее решение (`bvs1_flight.py`/`bvs2_flight.py`/`diagnosis.py` и модули
-`flight_core`/`flight_nav`), летавшее по глобальной локализации `aruco_map`,
-удалено — осталось в ветке `main`.
+Удалено из этой ветки (осталось в `main`): прежнее решение на глобальной
+локализации `aruco_map` (`bvs1_flight.py`, `bvs2_flight.py`, `diagnosis.py`,
+`lib/flight_core.py`, `lib/flight_nav.py`, `lib/flight_test_support.py`),
+имитатор зарядной станции (`charging_station.py`,
+`lib/energy_relay_vision.py`, `lib/station_protocol.py`), захват груза
+(`lib/gripper_control.py`) и синхронизация двух бортов
+(`lib/mission_sync.py`). Модули станции и БВС-2 писать заново, когда дойдёт
+очередь.
 
 **Проверить на площадке в первый день** (допущения, сделанные без доступа к
 реальному ROS 1/дрону): направление нумерации `config/field_map.txt`

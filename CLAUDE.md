@@ -22,29 +22,35 @@ Code).
 
 ## Структура репозитория
 
-В корне — только то, что запускают напрямую (`uav1_flight.py` на дроне,
-`charging_station.py` на Raspberry Pi станции) и этот README; общие модули —
-в `lib/`, карта поля — в `config/`, регламент/план — в `docs/`. `CLAUDE.md` —
-по конвенции Claude Code остаётся в корне (иначе не подхватывается
-автоматически), даже несмотря на то что это не «файл запуска» — исключение
-из общего правила.
+В корне — только то, что запускают напрямую (`uav1_flight.py` на дроне) и
+этот README; общие модули — в `lib/`, карта поля — в `config/`,
+регламент/план — в `docs/`. `CLAUDE.md` — по конвенции Claude Code остаётся в
+корне (иначе не подхватывается автоматически), даже несмотря на то что это не
+«файл запуска» — исключение из общего правила.
 
 Корневые скрипты сами добавляют `lib/` в `sys.path`
 (`sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))` в самом
 начале файла, до импорта модулей из `lib/`) — благодаря этому модули внутри
 `lib/` импортируют друг друга обычными `import marker_nav as nav` без
 относительных импортов и без установки пакета, и при этом каждый из них
-всё равно можно запускать напрямую как `python3 lib/station_protocol.py
+всё равно можно запускать напрямую как `python3 lib/marker_nav.py
 --self-test` (сработает, потому что соседние модули лежат в той же папке).
 **Новый файл в `lib/` не нуждается в собственном sys.path-хаке** — это
 делают только корневые скрипты.
 
-**Прежнее решение удалено** (ветка `main` его ещё содержит):
-`bvs1_flight.py`, `bvs2_flight.py`, `diagnosis.py`, `lib/flight_core.py`,
-`lib/flight_nav.py`, `lib/flight_test_support.py` летали по глобальной
-локализации платформы (`aruco_map`). Не воскрешай этот подход и не тяни из
-него код: полёт теперь строится только на том, что видно камерой (см.
-«Архитектура»).
+**В этой ветке — только БВС-1.** Всё остальное удалено (и осталось в ветке
+`main`, вернуть можно `git checkout main -- <файл>`):
+
+- прежние полётные скрипты на глобальной локализации `aruco_map`
+  (`bvs1_flight.py`, `bvs2_flight.py`, `diagnosis.py`, `lib/flight_core.py`,
+  `lib/flight_nav.py`, `lib/flight_test_support.py`) — **не воскрешай этот
+  подход и не тяни из него код**: полёт теперь строится только на том, что
+  видно камерой (см. «Архитектура»);
+- зарядная станция (`charging_station.py`, `lib/energy_relay_vision.py`,
+  `lib/station_protocol.py`), захват груза БВС-2 (`lib/gripper_control.py`) и
+  синхронизация двух бортов (`lib/mission_sync.py`).
+
+Не добавляй сюда код для БВС-2 или станции без явной просьбы.
 
 ## Команды
 
@@ -55,11 +61,6 @@ Code).
 ```bash
 python3 lib/marker_nav.py --self-test
 python3 lib/led_interface.py --self-test
-python3 lib/gripper_control.py --self-test
-python3 lib/energy_relay_vision.py --self-test
-python3 lib/station_protocol.py --self-test
-python3 lib/mission_sync.py --self-test
-python3 charging_station.py --repo-root . --self-test
 ```
 
 `lib/marker_nav.py` без флага (`python3 lib/marker_nav.py --map ...`) печатает
@@ -67,12 +68,9 @@ python3 charging_station.py --repo-root . --self-test
 препятствий, не запуская ничего на дроне. Сам `uav1_flight.py` самотеста не
 имеет: он весь про ROS, и проверяется на дроне через `--probe` (без моторов).
 
-`lib/gripper_control.py` тестируется через `TechnicGPIOBackend(runner=...)` —
-конструктор принимает `runner` для подмены реального процесса `gpio`, поэтому
-самотест возможен без Orange Pi (не путать с самим сервоприводом/захватом —
-их поведение самотест не проверяет). `lib/energy_relay_vision.py --self-test`
-требует `opencv-contrib-python`/`numpy` в окружении разработки — без них
-модуль сразу завершится понятной ошибкой (это его собственная защита, не баг).
+Самотест `marker_nav` не требует ни ROS, ни OpenCV: `cv2` нужен только
+`MarkerDetector`, то есть распознаванию меток на дроне. Держи это разделение
+при правках — иначе расчётная часть перестанет проверяться на десктопе.
 
 Запуск полётного сценария на дроне и параметры CLI (`--map`,
 `--start-marker`, `--station-marker`, `--station-height`, `--tree-markers`,
@@ -85,9 +83,7 @@ python3 charging_station.py --repo-root . --self-test
 **Принцип, общий для всех модулей**: рабочая логика не импортирует `rospy`/
 `technic`/`mavros_msgs`/`cv_bridge` на верхнем уровне. Импорт ROS-специфики
 спрятан внутри «backend»/«init»-функций (`uav1_flight.init_ros`,
-`led_interface.use_technic_ros1_backend`,
-`gripper_control.use_technic_gpio_gripper`,
-`energy_relay_vision.TechnicROS1Vision`) и вызывается один раз в `main()`
+`led_interface.use_technic_ros1_backend`) и вызывается один раз в `main()`
 каждого скрипта; `cv2` точно так же спрятан в `marker_nav.MarkerDetector`.
 Вся остальная логика получает нужные операции как явно переданные
 callable/прокси (см. `RosLink` в `uav1_flight.py`) — поэтому её можно
@@ -111,28 +107,10 @@ ROS. **При добавлении новой ROS-зависимости сле�
      `get_telemetry`, ни `aruco_map`, ни TF; всё считается по кадру.
    - `lib/led_interface.py` — `set_led(pattern, color)` через
      `LEDController`/`LEDBackend`; есть `ConsoleBackend` и `CallbackBackend`
-     для тестов/симуляции помимо `TechnicROS1Backend`.
-   - `lib/gripper_control.py` — `gripper_open()`/`gripper_close()`; захват
-     управляется **не через ROS**, а напрямую CLI-утилитой `gpio` (WiringPi)
-     на Orange Pi (`TechnicGPIOBackend`/`_run_gpio_cli`).
-   - `lib/energy_relay_vision.py` — `StationVision` (HSV-детектор цвета
-     станции + опциональный ArUco) поверх кадров; `TechnicROS1Vision`
-     подключает его к топику `main_camera/image_raw` через `cv_bridge`.
-     Позицию/ID меток даёт сам `aruco_pose` (топик `aruco_detect/markers`),
-     здесь решается только задача цвета станции.
+     для тестов/симуляции помимо `TechnicROS1Backend`. К полётному сценарию
+     пока не подключён — индикация по Табл.1 ставится следующим шагом.
 
-2. **Межбортовой протокол (Приоритет 4)** (`lib/`) — самостоятельные модули,
-   пока **не подключённые** к полётным сценариям (интеграция — Приоритет 5):
-   - `lib/station_protocol.py` — сигналы БВС↔станция (`Signal` enum,
-     `send_signal`/`wait_for_signal`/`wait_for_takeoff_command`), включая
-     ожидание команды на взлёт с клавиатуры оператора.
-   - `lib/mission_sync.py` — синхронный взлёт двух БВС через `TakeoffBarrier`
-     по TCP (`serve_takeoff_barrier` на ноутбуке оператора,
-     `wait_at_takeoff_barrier` на каждом Orange Pi) и `run_concurrently` для
-     запуска асинхронных задач с ожиданием по событию/таймауту вместо
-     жёсткого `sleep`.
-
-3. **Полётный сценарий** (корень репозитория) — собирает слои 1 и 2:
+2. **Полётный сценарий** (корень репозитория) — собирает слой 1:
    - `uav1_flight.py` — `MissionConfig` + `Pilot` + `run_mission`: маршрут в
      обход деревьев печатается до взлёта → вертикальный взлёт на `--alt`
      (`auto_arm=True`) → `settle()` и калибровка (эталон высоты `side_ref`,
