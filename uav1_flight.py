@@ -942,6 +942,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "станций, груз) — их камера не видит никогда; 'none' — нет таких")
     parser.add_argument("--start-tolerance", type=float, default=default.start_tolerance,
                         help="допуск сверки места со стартовой меткой после взлёта, м")
+    parser.add_argument("--blind-tolerance", type=float, default=default.blind_tolerance,
+                        help="какой расчётный остаток считать «встали» над закрытой "
+                             "меткой, м — поднимать, если дрон не может удержаться "
+                             "точнее и миссия срывается у станции")
+    parser.add_argument("--blind-confirm", type=int, default=default.blind_confirm,
+                        help="столько кадров подряд остаток должен быть мал")
     parser.add_argument("--hop-pad", type=float, default=default.hop_pad)
     parser.add_argument("--hop-max-steps", type=float, default=default.hop_max_steps)
     parser.add_argument("--step-length", type=float, default=default.step_length,
@@ -1016,6 +1022,8 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         tree_height=args.tree_height,
         blind_markers=_parse_blind_markers(args.blind_markers),
         start_tolerance=args.start_tolerance,
+        blind_tolerance=args.blind_tolerance,
+        blind_confirm=args.blind_confirm,
         tree_clearance=args.tree_clearance,
         tree_guard_clearance=args.tree_guard_clearance,
         tree_vertical_margin=args.tree_vertical_margin,
