@@ -581,22 +581,38 @@ def _self_test() -> None:
     map_path = Path(__file__).resolve().parent.parent / "config" / "field_map.txt"
     field = read_field_map(str(map_path))
     assert len(field) == 49, len(field)
-    assert marker_xy(field, 5) == (5.0, 0.0)
-    assert marker_xy(field, 48) == (6.0, 6.0)
     assert abs(field_step(field) - 1.0) < 1e-9
-    assert nearest_marker_id(field, 5.4, 0.1) == 5
 
-    # Деревья: ствол — центр четырёх меток, вокруг которых он стоит.
+    # Оси карты. Начало — метка 48, X в сторону 41, Y в сторону 47.
+    assert marker_xy(field, 48) == (0.0, 0.0), marker_xy(field, 48)
+    assert marker_xy(field, 41) == (1.0, 0.0), marker_xy(field, 41)
+    assert marker_xy(field, 47) == (0.0, 1.0), marker_xy(field, 47)
+    assert nearest_marker_id(field, 0.1, 0.9) == 47
+
+    # Тройка должна быть ПРАВОЙ (ROS работает в ENU, Z вверх): векторное
+    # произведение X на Y смотрит вверх, то есть его z-компонента положительна.
+    # Прежняя карта была зеркальной — «вправо» задавалось как +X, а «вниз» того
+    # же вида сверху как +Y. Никакой поворот такую пару с реальностью не
+    # совмещает, отсюда и была путаница x/y в полёте.
+    axis_x = marker_xy(field, 41)
+    axis_y = marker_xy(field, 47)
+    assert axis_x[0] * axis_y[1] - axis_x[1] * axis_y[0] > 0, "карта зеркальная"
+
+    # Деревья: ствол — центр четырёх меток, вокруг которых он стоит, то есть
+    # ровно в половине шага от каждой из них.
     trees = tree_positions(field)
-    assert trees[0] == (5.5, 1.5), trees[0]
-    assert set(trees) == {(5.5, 1.5), (3.5, 5.5), (2.5, 1.5), (0.5, 4.5)}
-    assert tree_hit(5.6, 1.6, trees, 0.5) == (5.5, 1.5)
+    assert len(trees) == 4, trees
+    for group, tree in zip(DEFAULT_TREE_GROUPS, trees):
+        for mid in group:
+            mx, my = marker_xy(field, mid)
+            assert abs(math.hypot(mx - tree[0], my - tree[1]) - math.sqrt(0.5)) < 1e-9
+    near = trees[0]
+    assert tree_hit(near[0] + 0.1, near[1] + 0.1, trees, 0.5) == near
     assert tree_hit(3.0, 3.0, trees, 0.5) is None
 
-    # Прямая «старт -> станция» проходит в 0.25 м от дерева (5.5, 1.5) — ради
-    # этого и нужен маршрут по решётке, где зазор до ствола не меньше половины
-    # ячейки.
-    assert not segment_is_clear((6.0, 6.0), (5.0, 0.0), trees, 0.5)
+    # Прямая «старт -> станция» проходит в 0.25 м от дерева — ради этого и
+    # нужен маршрут по решётке, где зазор до ствола не меньше половины ячейки.
+    assert not segment_is_clear(marker_xy(field, 48), marker_xy(field, 5), trees, 0.5)
 
     for clearance, expected in ((0.5, 7), (0.8, 9)):
         route = plan_route(field, 48, 5, trees=trees, clearance=clearance)

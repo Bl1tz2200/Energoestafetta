@@ -150,6 +150,13 @@ class MissionConfig:
     frame_timeout: float = 2.0
     camera_topic: str = "main_camera/image_raw"
     rangefinder_topic: str = "/rangefinder/range"
+    # Как лететь:
+    #   markers   — по видимым меткам, место считается по кадру (см. marker_nav);
+    #   aruco-map — по позиции платформы, navigate() абсолютными координатами
+    #               карты. Так летают соперники; требует, чтобы map1.txt на
+    #               платформе совпадал с config/field_map.txt.
+    nav_mode: str = "markers"
+    map_tolerance: float = 0.25  # «дошли» в режиме aruco-map, м
     node_name: str = "uav1_flight"
     quiet: bool = False
 
@@ -174,6 +181,10 @@ class RosLink:
     arming: Callable[[bool], Any]
     read_frame: Callable[[float], Any]
     read_range: Callable[[float], float]
+    # Позиция от платформы (aruco_map). Полёту по меткам она не нужна, но по
+    # ней проверяются направления осей карты и она же — источник положения
+    # для самого PX4, поэтому читать её полезно всегда.
+    get_telemetry: Optional[Callable[..., Any]] = None
 
 
 def init_ros(config: MissionConfig, *, init_node: bool = True) -> RosLink:
@@ -195,6 +206,7 @@ def init_ros(config: MissionConfig, *, init_node: bool = True) -> RosLink:
         rospy.init_node(config.node_name)
 
     navigate = rospy.ServiceProxy("navigate", srv.Navigate)
+    get_telemetry = rospy.ServiceProxy("get_telemetry", srv.GetTelemetry)
     land = rospy.ServiceProxy("land", Trigger)
     arming_proxy = rospy.ServiceProxy("mavros/cmd/arming", CommandBool)
     bridge = CvBridge()
@@ -213,6 +225,7 @@ def init_ros(config: MissionConfig, *, init_node: bool = True) -> RosLink:
         arming=lambda value: arming_proxy(value),
         read_frame=read_frame,
         read_range=read_range,
+        get_telemetry=get_telemetry,
     )
 
 
@@ -572,6 +585,70 @@ class Pilot:
             limit=self.config.alt_fix, dead_zone=self.config.alt_dead_zone,
         )
 
+    # ------------------------------------------------- перелёт по aruco_map
+    def goto_map(self, target_id: int) -> bool:
+        """Долететь до метки по позиции платформы. True — дошли.
+
+        Здесь ни кадр, ни ``marker_nav`` не участвуют: место берётся из
+        ``get_telemetry(frame_id='aruco_map')``, а цель задаётся абсолютными
+        координатами той же карты. Так летают соперники, и это работает ровно
+        настолько, насколько верна карта на платформе (``map1.txt``) —
+        проверять её направления осей режимом ``--probe``.
+
+        ``yaw=0.0`` в кадре карты означает «нос вдоль оси X карты» (в сторону
+        метки 41): курс фиксируется раз и больше не уплывает, в отличие от
+        ``body``, где каждая команда принимает текущий курс за норму.
+        """
+        tx, ty = nav.marker_xy(self.field, target_id)
+        for _ in range(self.config.tries):
+            pose = self.read_map_pose()
+            if pose is None:
+                raise FlightAborted(
+                    "aruco_map не отдаёт позицию — в режиме --nav-mode aruco-map "
+                    "лететь не по чему")
+            x, y = pose[0], pose[1]
+            if not self.fence.contains(x, y):
+                raise FlightAborted(
+                    "дрон вне поля: ({:.2f}, {:.2f}), разрешено {}".format(
+                        x, y, self.fence.describe()))
+            tree = nav.tree_hit(x, y, self.trees, self.config.tree_guard_clearance)
+            if tree is not None:
+                raise FlightAborted(
+                    "дрон вплотную к дереву ({:.1f}, {:.1f}) — расходимся".format(*tree))
+
+            distance = math.hypot(tx - x, ty - y)
+            self.say("цель {:2d} | aruco_map ({:.2f}, {:.2f}) | до цели {:.2f} м".format(
+                target_id, x, y, distance))
+            if distance <= self.config.map_tolerance:
+                self.say("          над меткой {}".format(target_id))
+                return True
+
+            self._navigate_map(tx, ty)
+            self.sleep(distance / max(self.config.speed, 0.05) + self.config.hop_pad)
+
+        self.say("          узел {} пропущен".format(target_id))
+        return False
+
+    def _navigate_map(self, x: float, y: float) -> None:
+        """``navigate()`` абсолютной точкой карты со счётчиком отказов."""
+        try:
+            response = self.ros.navigate(
+                x=float(x), y=float(y), z=float(self.config.alt), yaw=0.0,
+                speed=float(self.config.speed), frame_id="aruco_map", auto_arm=False)
+            refused = response is not None and not getattr(response, "success", True)
+            why = getattr(response, "message", "")
+        except Exception as exc:  # noqa: BLE001
+            refused, why = True, "исключение: {}".format(exc)
+        if refused:
+            self.nav_fails += 1
+            self.say("          navigate отказал ({}/{}): {}".format(
+                self.nav_fails, self.config.nav_fail_max, why))
+            if self.nav_fails >= self.config.nav_fail_max:
+                raise FlightAborted(
+                    "navigate отказал {} раз подряд".format(self.nav_fails))
+        else:
+            self.nav_fails = 0
+
     # ------------------------------------------------------------- перелёт
     def goto(self, target_id: int, *, blind: bool = False) -> bool:
         """Довести дрон до метки ``target_id``. True — встали над ней.
@@ -795,6 +872,27 @@ class Pilot:
                 return True
         return False
 
+    def read_map_pose(self) -> Optional[Tuple[float, float, float, float]]:
+        """Позиция от платформы: ``get_telemetry(frame_id='aruco_map')``.
+
+        В навигации по меткам не используется — нужна для проверки осей карты
+        и как признак того, что PX4 вообще получает положение (он берёт его из
+        того же ``aruco_map`` через ``mavros/vision_pose/pose``).
+        """
+        if self.ros.get_telemetry is None:
+            return None
+        try:
+            telemetry = self.ros.get_telemetry(frame_id="aruco_map")
+            values = (float(telemetry.x), float(telemetry.y),
+                      float(getattr(telemetry, "z", float("nan"))),
+                      float(getattr(telemetry, "yaw", float("nan"))))
+        except Exception as exc:  # noqa: BLE001
+            self.say("          aruco_map молчит: {}".format(exc))
+            return None
+        if math.isnan(values[0]) or math.isnan(values[1]):
+            return None  # платформа так сообщает «фрейма нет»
+        return values
+
     def read_range(self) -> Optional[float]:
         try:
             return self.ros.read_range(self.config.rangefinder_timeout)
@@ -865,6 +963,9 @@ def run_mission(pilot: Pilot) -> bool:
             "сторож запретит спланированный маршрут".format(
                 config.tree_guard_clearance, config.tree_clearance))
 
+    if config.nav_mode == "aruco-map":
+        return _run_mission_by_map(pilot, route)
+
     pilot.takeoff()
 
     for mid in route[:-1]:
@@ -889,6 +990,54 @@ def run_mission(pilot: Pilot) -> bool:
     return False
 
 
+def _run_mission_by_map(pilot: Pilot, route: Sequence[int]) -> bool:
+    """Тот же сценарий, но место берётся у платформы (``--nav-mode aruco-map``).
+
+    Камера и ``marker_nav`` здесь не участвуют вовсе: позиция — из
+    ``get_telemetry(frame_id='aruco_map')``, цель — абсолютной точкой той же
+    карты. Взлёт и посадка на куб общие с основным режимом.
+    """
+    config = pilot.config
+    pose = pilot.read_map_pose()
+    if pose is None:
+        raise FlightAborted(
+            "aruco_map не отдаёт позицию ещё до взлёта — проверьте ноду и map1.txt "
+            "(README, «Подготовка окружения на борту»)")
+    start_xy = nav.marker_xy(pilot.field, config.start_marker_id)
+    error = math.hypot(pose[0] - start_xy[0], pose[1] - start_xy[1])
+    pilot.say(">>> НА ЗЕМЛЕ по aruco_map: ({:.2f}, {:.2f}), старт {} в ({:.2f}, {:.2f}), "
+              "расхождение {:.2f} м".format(
+                  pose[0], pose[1], config.start_marker_id, start_xy[0], start_xy[1], error))
+    if error > config.start_tolerance:
+        raise FlightAborted(
+            "на земле aruco_map показывает ({:.2f}, {:.2f}) вместо ({:.2f}, {:.2f}): "
+            "карта на платформе не совпадает с полем — взлетать нельзя".format(
+                pose[0], pose[1], start_xy[0], start_xy[1]))
+
+    pilot.say("ВЗЛЁТ на {:.2f} м (frame_id='body', auto_arm=True)".format(config.alt))
+    pilot.fly(0.0, 0.0, config.alt, speed=config.climb_speed, auto_arm=True)
+    pilot.armed = True
+    pilot.sleep(config.settle_s)
+
+    for mid in route[:-1]:
+        pilot.goto_map(mid)
+
+    station = route[-1] if route else config.station_marker_id
+    pilot.say("подход к станции (метка {}, наводимся по aruco_map)".format(station))
+    if not pilot.goto_map(station):
+        raise FlightAborted("над станцией встать не удалось — на куб не садимся")
+    pilot.sleep(config.settle_s)
+
+    if pilot.descend_onto_station():
+        pilot.say(">>> БВС-1 НА ЗАРЯДНОЙ СТАНЦИИ, МОТОРЫ ВЫКЛЮЧЕНЫ")
+        return True
+
+    pilot.say("!!! касание не подтверждено — садимся штатно")
+    pilot.hold()
+    pilot.land()
+    return False
+
+
 def run_probe(pilot: Pilot, *, cycles: int = 0) -> None:
     """Проверка зрения без моторов: что видно, где мы и каким будет маршрут."""
     config = pilot.config
@@ -902,6 +1051,15 @@ def run_probe(pilot: Pilot, *, cycles: int = 0) -> None:
         config.start_marker_id, config.station_marker_id,
         " -> ".join(str(mid) for mid in route)))
     print("метки читаются словарём {}; моторы не трогаем".format(config.aruco_dict))
+    print()
+    print("ПРОВЕРКА ОСЕЙ (моторы выключены, дрон носим руками):")
+    for mid in (config.start_marker_id, ) + tuple(
+            m for m in (41, 47) if m in pilot.field and m != config.start_marker_id):
+        x, y = nav.marker_xy(pilot.field, mid)
+        print("  над меткой {:2d} ожидаем ({:.2f}, {:.2f})".format(mid, x, y))
+    print("  если x и y поменяны местами или растут не в ту сторону —")
+    print("  карта на платформе (map1.txt) не совпадает с config/field_map.txt")
+    print()
 
     count = 0
     while cycles <= 0 or count < cycles:
@@ -925,6 +1083,17 @@ def run_probe(pilot: Pilot, *, cycles: int = 0) -> None:
                     "{:.2f} м".format(step) if step else "нет пары соседей",
                 )
             )
+        pose = pilot.read_map_pose()
+        if pose is None:
+            print("          aruco_map: позиции нет — PX4 нечем держать точку!")
+        else:
+            near = nav.nearest_marker_id(pilot.field, pose[0], pose[1])
+            near_xy = nav.marker_xy(pilot.field, near)
+            print("          aruco_map: ({:.2f}, {:.2f}, {:.2f}) курс {:+.0f}° | "
+                  "ближайшая метка {} в ({:.2f}, {:.2f}), до неё {:.2f} м".format(
+                      pose[0], pose[1], pose[2], math.degrees(pose[3]), near,
+                      near_xy[0], near_xy[1],
+                      math.hypot(pose[0] - near_xy[0], pose[1] - near_xy[1])))
         distance = pilot.read_range()
         if distance is not None:
             print("          дальномер: {:.2f} м".format(distance))
@@ -1021,6 +1190,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--geofence-margin", type=float, default=default.geofence_margin)
     parser.add_argument("--camera-topic", default=default.camera_topic)
     parser.add_argument("--rangefinder-topic", default=default.rangefinder_topic)
+    parser.add_argument("--nav-mode", choices=("markers", "aruco-map"),
+                        default=default.nav_mode,
+                        help="markers — по видимым меткам (по умолчанию); "
+                             "aruco-map — по позиции платформы, абсолютными точками")
+    parser.add_argument("--map-tolerance", type=float, default=default.map_tolerance,
+                        help="«дошли до узла» в режиме aruco-map, м")
     parser.add_argument("--probe", action="store_true",
                         help="проверка зрения без моторов: что видно и каким будет маршрут")
     parser.add_argument("--quiet", action="store_true")
@@ -1064,6 +1239,8 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         geofence_margin=args.geofence_margin,
         camera_topic=args.camera_topic,
         rangefinder_topic=args.rangefinder_topic,
+        nav_mode=args.nav_mode,
+        map_tolerance=args.map_tolerance,
         quiet=args.quiet,
     )
 
