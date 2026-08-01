@@ -50,6 +50,11 @@ ssh orangepi@<ip-бвс> 'cd ~/energoestafetta && python3 lib/marker_nav.py --se
 source /opt/ros/noetic/setup.bash        # только в неинтерактивном контексте:
 source ~/technic_ws/devel/setup.bash     # при входе по SSH это делается само
 
+# ГЛАВНАЯ проверка перед полётом: PX4 получает положение от aruco_map?
+rostopic hz /mavros/vision_pose/pose     # должно идти ~10-30 Гц, без пауз
+rostopic echo -n1 /aruco_map/pose        # координаты = реальному месту дрона
+cat ~/technic_ws/src/technic/aruco_pose/map/map1.txt   # сверить с config/field_map.txt
+
 python3 uav1_flight.py --probe --map config/field_map.txt   # зрение, моторы не трогаем
 python3 uav1_flight.py --probe --aruco-dict DICT_4X4_100    # если метки не распознаются
 chmod +x uav1_flight.py lib/marker_nav.py lib/led_interface.py   # если нужен ./запуск
@@ -476,10 +481,34 @@ source ~/technic_ws/devel/setup.bash   # или свой catkin_ws с technic/le
 ```
 
 Платформенный `technic.launch` стартует сам при включении дрона и поднимает
-камеру, MAVROS и дальномер. Ноду `aruco_map` (карта поля на стороне
-платформы) `uav1_flight.py` **не использует** — метки он распознаёт сам по
-кадру, поэтому синхронизировать `aruco_pose/map/map1.txt` с
-`config/field_map.txt` больше не требуется.
+камеру, MAVROS и дальномер.
+
+**Ноду `aruco_map` не выключайте, хотя наш скрипт её не использует.** Метки
+`uav1_flight.py` распознаёт сам по кадру и позицию от платформы не берёт —
+но её берёт **сам PX4**: `aruco_map` публикует `mavros/vision_pose/pose`, и
+без этого у полётного контроллера в помещении нет источника положения. Дрон
+тогда не держит точку: раскачивается, подворачивает по курсу и уезжает —
+причём ещё до того, как скрипт отдаст хоть одну команду перемещения.
+
+По той же причине карта на стороне платформы должна совпадать с нашей:
+
+```bash
+cat ~/technic_ws/src/technic/aruco_pose/map/map1.txt   # сверить с config/field_map.txt
+
+cp ~/energoestafetta/config/field_map.txt ~/technic_ws/src/technic/aruco_pose/map/map1.txt
+rosnode kill /aruco_map    # respawn="true" в launch поднимет ноду заново
+```
+
+Проверить, что PX4 действительно получает положение (дрон стоит на полу,
+моторы выключены):
+
+```bash
+rostopic hz /mavros/vision_pose/pose     # должно идти ~10-30 Гц, без пауз
+rostopic echo -n1 /aruco_map/pose        # координаты должны совпадать с местом дрона
+```
+
+Молчащий или скачущий `vision_pose` — это и есть причина «летит как FPV»;
+никакие флаги скрипта этого не лечат.
 
 ### Известная проблема: `SystemError: initialization of cv_bridge_boost raised unreported exception`
 

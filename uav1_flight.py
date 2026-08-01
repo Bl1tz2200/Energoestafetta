@@ -687,7 +687,12 @@ class Pilot:
         self.say("ВЗЛЁТ на {:.2f} м (frame_id='body', auto_arm=True)".format(self.config.alt))
         self.fly(0.0, 0.0, self.config.alt, speed=self.config.climb_speed, auto_arm=True)
         self.armed = True
-        self.sleep(self.config.settle_s)
+
+        # Сверка места ПЕРВЫМ ЖЕ годным кадром, до долгого успокоения. Дрон,
+        # который не держит точку, уезжает именно в эти секунды: пока идёт
+        # settle(), команд не отдаётся вовсе, и раньше сценарий узнавал об
+        # отъезде секунд через десять — когда дрон уже был у сетки.
+        self._confirm_start("сразу после взлёта")
 
         side = self.settle()
         if side <= 1.0:
@@ -703,6 +708,20 @@ class Pilot:
         self.say(">>> ВЫСОТА {:.2f} м = метка {:.0f} px в кадре (эталон)".format(
             self.config.alt, side))
 
+        # Повторная сверка по спокойному кадру: за время успокоения дрон мог
+        # уехать, а лететь по маршруту от неверного места — как раз тот случай,
+        # из-за которого переписывалось всё решение.
+        self._confirm_start("после успокоения")
+
+    def _confirm_start(self, stage: str) -> None:
+        """Сверить расчётное место с координатами стартовой метки.
+
+        Стартовую метку дрон НЕ увидит: её закрывает площадка «Н», как куб
+        закрывает метку станции. Поэтому сверяем не «что под дроном», а
+        расчётное место по окрестным меткам с координатами стартовой метки по
+        карте: это ловит и не ту раскладку, и не ту площадку, и отъезд дрона,
+        но не требует видеть то, чего не видно.
+        """
         # Место определяется по паре меток: одной мало (по ней не измерить
         # поворот поля). В углу поля, где стартовая метка закрыта площадкой,
         # пары в кадре может не оказаться — тогда поднимаемся и расширяем обзор.
@@ -717,33 +736,33 @@ class Pilot:
                     "измерить, лететь по карте нельзя")
             sight = self.look()
 
-        # Стартовую метку дрон НЕ увидит: её закрывает площадка «Н», как куб
-        # закрывает метку станции. Поэтому сверяем не «что под дроном», а
-        # расчётное место по окрестным меткам с координатами стартовой метки
-        # по карте: это ловит и не ту раскладку, и не ту площадку, и грубую
-        # ошибку опознания, но не требует видеть то, чего не видно.
-        start_xy = nav.marker_xy(self.field, self.config.start_marker_id)
-        error = math.hypot(sight.position[0] - start_xy[0], sight.position[1] - start_xy[1])
-        self.say(
-            ">>> ПОСЛЕ ВЗЛЁТА: место ({:.2f}, {:.2f}), старт {} в ({:.2f}, {:.2f}), "
-            "расхождение {:.2f} м | видно: {}".format(
-                sight.position[0], sight.position[1], self.config.start_marker_id,
-                start_xy[0], start_xy[1], error,
-                " ".join(str(mid) for mid in sorted(sight.seen))))
-        if error > self.config.start_tolerance:
-            raise FlightAborted(
-                "после взлёта дрон в ({:.2f}, {:.2f}), а стартовая метка {} — "
-                "в ({:.2f}, {:.2f}): расхождение {:.2f} м больше "
-                "--start-tolerance {:.2f} м".format(
-                    sight.position[0], sight.position[1], self.config.start_marker_id,
-                    start_xy[0], start_xy[1], error, self.config.start_tolerance))
-
+        # Замер шага решётки печатается ДО проверки: если сверка не сойдётся,
+        # именно он скажет, виноват ли масштаб (--marker-size), а не место.
         measured = nav.measured_grid_step(sight.seen, self.field, self.config.marker_size)
         if measured:
             self.say(">>> ШАГ РЕШЁТКИ: {:.2f} м (по карте {:.2f} м)".format(
                 measured, self.grid_step))
             if abs(measured - self.grid_step) > 0.3:
-                self.say("!!! ПРОВЕРЬТЕ --marker-size: замер шага сильно расходится с картой")
+                self.say("!!! ПРОВЕРЬТЕ --marker-size: замер шага сильно расходится "
+                         "с картой — масштаб кадра неверен, а с ним и все поправки")
+
+        start_xy = nav.marker_xy(self.field, self.config.start_marker_id)
+        error = math.hypot(sight.position[0] - start_xy[0], sight.position[1] - start_xy[1])
+        self.say(
+            ">>> {}: место ({:.2f}, {:.2f}), старт {} в ({:.2f}, {:.2f}), "
+            "расхождение {:.2f} м | видно: {}".format(
+                stage.upper(), sight.position[0], sight.position[1],
+                self.config.start_marker_id, start_xy[0], start_xy[1], error,
+                " ".join(str(mid) for mid in sorted(sight.seen))))
+        if error > self.config.start_tolerance:
+            raise FlightAborted(
+                "{}: дрон в ({:.2f}, {:.2f}), а стартовая метка {} — в "
+                "({:.2f}, {:.2f}): расхождение {:.2f} м больше --start-tolerance "
+                "{:.2f} м. Дрон не удержал точку — разбираться с оценкой "
+                "положения в PX4, а не с флагами скрипта".format(
+                    stage, sight.position[0], sight.position[1],
+                    self.config.start_marker_id, start_xy[0], start_xy[1], error,
+                    self.config.start_tolerance))
 
     # ------------------------------------------------------------- посадка
     def descend_onto_station(self) -> bool:
