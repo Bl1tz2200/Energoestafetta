@@ -75,8 +75,16 @@ class MissionConfig:
     # вперёд, и контроллер PX4 отрабатывает эту ошибку положения наклоном:
     # чем длиннее шаг, тем больше наклон и тем сильнее разгон. Поэтому
     # уменьшение ``speed`` само по себе рывки не убирает — нужно уменьшать шаг.
-    step_length: float = 0.3  # максимум одной горизонтальной команды, м
+    step_length: float = 0.3  # максимум одного горизонтального шага, м
     climb_step: float = 0.5  # максимум одной вертикальной команды, м
+    # Горизонтальный шаг отдаётся не одной командой, а ЛЕСЕНКОЙ микрокоманд по
+    # micro_step через micro_pause. Смысл: цель всё время держится в нескольких
+    # сантиметрах впереди дрона, поэтому ошибка положения — а значит и наклон,
+    # которым её отрабатывает PX4, — остаётся малой на всём перелёте. Так
+    # скорость задаётся отношением micro_step/micro_pause (здесь 0.2 м/с) и не
+    # зависит от того, как прошивка понимает аргумент speed.
+    micro_step: float = 0.06
+    micro_pause: float = 0.3
     # После каждого шага цель ставится в текущую точку (navigate(0,0,0,body)):
     # это гасит остаточную скорость, и следующий кадр снимается с неподвижного
     # дрона. Без торможения команды складываются с инерцией — дрон
@@ -265,20 +273,62 @@ class Pilot:
 
     # ------------------------------------------------------------ команда
     def hop(self, axis: str, value: float, *, speed: Optional[float] = None,
-            auto_arm: bool = False, brake: bool = True) -> None:
+            auto_arm: bool = False, brake: bool = True,
+            ramp: Optional[bool] = None) -> None:
         """ЕДИНСТВЕННОЕ место, откуда уходит navigate(): ровно одна ось.
 
         Две другие координаты всегда нули, ``frame_id='body'``. ``yaw`` не
         передаётся вовсе: штатное значение сервиса (0) в кадре ``body``
         означает «не менять курс», а это ровно то, что нужно.
 
-        Сервис асинхронный — дождаться выполнения можно только паузой (та же
-        схема, что в проверенном ``fly_head.py``): время в пути плюс запас
-        ``hop_pad`` на разгон, торможение и успокоение.
+        Горизонтальный шаг отдаётся **лесенкой микрокоманд** (``ramp``): цель
+        каждый раз переносится всего на ``micro_step`` вперёд от текущего
+        места, поэтому ошибка положения, которую PX4 отрабатывает наклоном,
+        всё время мала. Одна команда на весь шаг — это скачок ошибки на всю
+        его длину, и именно из-за него дрон резко кренился и проскакивал цель.
+        Скорость при этом задаётся не аргументом ``speed`` (прошивка
+        экспериментальная, полагаться на него нельзя), а самим темпом
+        ``micro_step / micro_pause``.
+
+        По вертикали лесенка не нужна: там нет ни сетки, ни стен, а отрыв от
+        земли, наоборот, должен быть решительным.
         """
         if axis not in ("x", "y", "z"):
             raise ValueError("Ось перелёта может быть только x, y или z: " + repr(axis))
         speed = speed if speed is not None else self.config.speed
+        if ramp is None:
+            ramp = axis in ("x", "y") and self.config.micro_step > 0.0
+
+        remaining = float(value)
+        first = True
+        while abs(remaining) > 1e-6:
+            piece = remaining
+            if ramp:
+                piece = math.copysign(min(self.config.micro_step, abs(remaining)), remaining)
+            self._navigate_once(axis, piece, speed, auto_arm and first)
+            first = False
+            remaining -= piece
+            if ramp and abs(remaining) > 1e-6:
+                self.sleep(self.config.micro_pause)
+
+        # Хвост: последней микрокоманде тоже нужно время долететь, а одиночной
+        # команде — весь путь целиком.
+        if ramp:
+            self.sleep(self.config.micro_pause + self.config.hop_pad)
+        else:
+            self.sleep(abs(float(value)) / max(speed, 0.05) + self.config.hop_pad)
+
+        # Торможение: цель переносится в текущую точку, остаточная скорость
+        # гасится, и следующая команда начинается с неподвижного дрона. Без
+        # этого шаги складываются с инерцией — дрон разгоняется от шага к шагу,
+        # проскакивает цель и «плывёт» дальше, чем ему было велено.
+        if brake:
+            self._stop_moving()
+            self.sleep(self.config.brake_pause)
+
+    def _navigate_once(self, axis: str, value: float, speed: float,
+                       auto_arm: bool) -> None:
+        """Одна команда navigate() со счётчиком отказов."""
         request = {"x": 0.0, "y": 0.0, "z": 0.0, "speed": float(speed),
                    "frame_id": "body", "auto_arm": bool(auto_arm)}
         request[axis] = float(value)
@@ -301,16 +351,6 @@ class Pilot:
             self.nav_fails = 0
             if auto_arm:
                 self.armed = True
-
-        self.sleep(abs(float(value)) / max(speed, 0.05) + self.config.hop_pad)
-
-        # Торможение: цель переносится в текущую точку, остаточная скорость
-        # гасится, и следующая команда начинается с неподвижного дрона. Без
-        # этого шаги складываются с инерцией — дрон разгоняется от шага к шагу,
-        # проскакивает цель и «плывёт» дальше, чем ему было велено.
-        if brake:
-            self._stop_moving()
-            self.sleep(self.config.brake_pause)
 
     def _stop_moving(self, *, speed: Optional[float] = None) -> None:
         """``navigate(0, 0, 0, frame_id='body')`` — «цель там, где я сейчас»."""
@@ -723,11 +763,15 @@ class Pilot:
             return None
 
     def disarm(self) -> None:
+        """Выключить моторы. Если сервиса армирования на этой сборке нет —
+        дожать штатной посадкой, а не оставлять дрон работающим на кубе."""
         try:
             self.ros.arming(False)
             self.armed = False
+            return
         except Exception as exc:  # noqa: BLE001
-            self.say("!!! дизарм не прошёл: {}".format(exc))
+            self.say("!!! дизарм не прошёл ({}) — дожимаем посадкой".format(exc))
+        self.land()
 
     def land(self, *, tries: int = 3) -> None:
         """Обычная посадка с повтором: одиночный ``land()`` — слабая гарантия."""
@@ -904,6 +948,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="максимум одной вертикальной команды, м")
     parser.add_argument("--brake-pause", type=float, default=default.brake_pause,
                         help="пауза на гашение скорости после каждого шага, с")
+    parser.add_argument("--micro-step", type=float, default=default.micro_step,
+                        help="длина микрокоманды внутри шага, м (0 — отдавать шаг "
+                             "одной командой, резче)")
+    parser.add_argument("--micro-pause", type=float, default=default.micro_pause,
+                        help="пауза между микрокомандами, с; вместе с --micro-step "
+                             "задаёт фактическую скорость перелёта")
     parser.add_argument("--no-settle-after-hop", dest="settle_after_hop",
                         action="store_false",
                         help="не ждать спокойного кадра после каждого шага (быстрее, "
@@ -951,6 +1001,8 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         hop_max_steps=args.hop_max_steps,
         step_length=args.step_length,
         climb_step=args.climb_step,
+        micro_step=args.micro_step,
+        micro_pause=args.micro_pause,
         brake_pause=args.brake_pause,
         settle_after_hop=args.settle_after_hop,
         alt_fix=args.alt_fix,
