@@ -90,6 +90,21 @@ class MissionConfig:
     # прошивка игнорирует аргумент speed и отрабатывает скачок цели рывком.
     micro_step: float = 0.0
     micro_pause: float = 0.3
+    # Максимум дистанции на ОДИН замер по меткам. Команда задаётся в осях
+    # корпуса, а корпус за время перелёта успевает подвернуть по курсу — и чем
+    # длиннее перелёт, тем сильнее фактическое направление расходится с
+    # посчитанным. Короткая дистанция между замерами ограничивает этот увод:
+    # остаток пересчитывается по свежему кадру, с уже новым курсом.
+    step_length: float = 0.3
+
+    # Удержание курса. По умолчанию выключено: команды по yaw в этой сборке не
+    # проверены, а неверный знак раскрутит дрон вместо того, чтобы удержать.
+    # Увод курса при этом ВСЕГДА измеряется и печатается в лог — по нему видно,
+    # нужно ли включать удержание (--hold-yaw) и не перепутан ли знак.
+    hold_yaw: bool = False
+    yaw_sign: float = 1.0  # -1, если с --hold-yaw дрон закручивается сильнее
+    yaw_fix: float = math.radians(10.0)  # предел доворота за одну команду
+    yaw_warn: float = math.radians(5.0)  # с какого увода писать в лог
 
     look_up: float = 0.3  # подъём «осмотреться», если меток не видно, м
     climb_max: float = 1.0  # выше рабочей высоты вслепую не подниматься, м
@@ -139,8 +154,10 @@ class MissionConfig:
     quiet: bool = False
 
     def hop_limit(self, grid_step: float) -> float:
-        """Предел длины одного перелёта, м (как ``HOP_MAX_STEPS`` в fly_head)."""
-        return self.hop_max_steps * grid_step
+        """Предел длины одного перелёта, м: аварийный (``HOP_MAX_STEPS`` как в
+        fly_head) и рабочий (``step_length``, ограничивает увод курса за
+        перелёт) — берётся меньший."""
+        return min(self.step_length, self.hop_max_steps * grid_step)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -215,6 +232,7 @@ class Sight:
     frame_yaw: Optional[float] = None
     position: Optional[Tuple[float, float]] = None
     altitude: float = 0.0
+    yaw_drift: float = 0.0  # на сколько увело курс от снятого на взлёте, рад
 
 
 class Pilot:
@@ -244,6 +262,11 @@ class Pilot:
         # подставить вместо него ноль — значит развернуть все расчёты места на
         # неизвестный угол. Пока здесь None, места дрон не знает и не летит.
         self.yaw_ref: Optional[float] = None
+        # Курс, снятый после взлёта: от него считается увод. Сам курс дрон
+        # нигде не задаёт, но подворачивать его в полёте он может — а команды
+        # идут в осях корпуса, и подвернувшийся корпус разворачивает их вместе
+        # с собой. Поэтому увод меряется всегда, даже когда не исправляется.
+        self.yaw_hold_ref: Optional[float] = None
         self.blind_up = 0.0  # набрано вслепую сверх рабочей высоты, м
         self.after_blind_climb = False  # см. altitude_correction: не отдавать высоту сразу
         self.nav_fails = 0
@@ -255,7 +278,7 @@ class Pilot:
             print(text, flush=True)
 
     # ------------------------------------------------------------ команда
-    def fly(self, forward: float, left: float, up: float = 0.0, *,
+    def fly(self, forward: float, left: float, up: float = 0.0, turn: float = 0.0, *,
             speed: Optional[float] = None, auto_arm: bool = False) -> None:
         """Смещение по корпусу одной командой: x вперёд, y влево, z вверх.
 
@@ -264,8 +287,8 @@ class Pilot:
         поправка высоты едет той же командой, что и смещение, отдельной
         команды на неё не появляется.
 
-        ``yaw=0.0`` в кадре ``body`` означает «не менять курс» — это штатное
-        значение сервиса, и именно так его передаёт fly_head.
+        ``turn`` — доворот по курсу той же командой (как ``turn`` в fly_head);
+        0.0 в кадре ``body`` означает «не менять курс».
 
         Сервис асинхронный, дождаться его можно только паузой: время в пути с
         учётом вертикали плюс запас ``hop_pad`` на разгон, торможение и
@@ -285,13 +308,13 @@ class Pilot:
             distance = limit
 
         if self.config.micro_step > 0.0:
-            self._fly_ramped(forward, left, up, speed, auto_arm)
+            self._fly_ramped(forward, left, up, turn, speed, auto_arm)
             return
 
-        self._navigate_once(forward, left, up, speed, auto_arm)
+        self._navigate_once(forward, left, up, turn, speed, auto_arm)
         self.sleep(math.hypot(distance, up) / max(speed, 0.05) + self.config.hop_pad)
 
-    def _fly_ramped(self, forward: float, left: float, up: float,
+    def _fly_ramped(self, forward: float, left: float, up: float, turn: float,
                     speed: float, auto_arm: bool) -> None:
         """Та же дистанция, но лесенкой команд по ``micro_step``.
 
@@ -304,15 +327,15 @@ class Pilot:
         pieces = max(1, int(math.ceil(total / self.config.micro_step)))
         for index in range(pieces):
             self._navigate_once(forward / pieces, left / pieces, up / pieces,
-                                speed, auto_arm and index == 0)
+                                turn / pieces, speed, auto_arm and index == 0)
             self.sleep(self.config.micro_pause)
         self.sleep(self.config.hop_pad)
 
-    def _navigate_once(self, forward: float, left: float, up: float,
+    def _navigate_once(self, forward: float, left: float, up: float, turn: float,
                        speed: float, auto_arm: bool) -> None:
         """Одна команда navigate() со счётчиком отказов."""
         request = {"x": float(forward), "y": float(left), "z": float(up),
-                   "yaw": 0.0, "speed": float(speed),
+                   "yaw": float(turn), "speed": float(speed),
                    "frame_id": "body", "auto_arm": bool(auto_arm)}
 
         try:
@@ -376,6 +399,8 @@ class Pilot:
         if measured_yaw is not None:
             self.yaw_ref = measured_yaw
         sight.frame_yaw = self.yaw_ref
+        if sight.frame_yaw is not None and self.yaw_hold_ref is not None:
+            sight.yaw_drift = nav.wrap_angle(sight.frame_yaw - self.yaw_hold_ref)
         if sight.frame_yaw is not None and sight.base is not None and sight.base.mid in self.field:
             sight.position = nav.estimate_position(
                 sight.base, self.field, self.yaw_ref, centre, self.config.marker_size
@@ -512,6 +537,21 @@ class Pilot:
             self.blind_up))
         self.fly(0.0, 0.0, self.config.look_up, speed=self.config.climb_speed)
 
+    def yaw_correction(self, sight: Sight) -> float:
+        """Доворот, возвращающий курс к снятому после взлёта. 0 — не трогаем.
+
+        Работает только с ``--hold-yaw``: команды по yaw на этой сборке не
+        проверены, а неверный знак раскрутит дрон вместо удержания. Знак
+        переключается флагом ``--yaw-sign`` прямо на площадке: если с
+        удержанием дрон закручивается быстрее, знак противоположный.
+        """
+        if not self.config.hold_yaw or self.yaw_hold_ref is None:
+            return 0.0
+        if abs(sight.yaw_drift) < self.config.yaw_warn:
+            return 0.0
+        turn = self.config.yaw_sign * sight.yaw_drift
+        return max(-self.config.yaw_fix, min(self.config.yaw_fix, turn))
+
     def altitude_correction(self, sight: Sight) -> float:
         """На сколько подняться (+) или опуститься (−) до рабочей высоты.
 
@@ -569,8 +609,10 @@ class Pilot:
             self.guard(sight)
             self.report(target_id, sight)
 
-            # Поправка высоты уйдёт той же командой, что и смещение.
+            # Поправка высоты и доворот курса уйдут той же командой, что и
+            # смещение — отдельных команд на них не появляется.
             up = self.altitude_correction(sight)
+            turn = self.yaw_correction(sight)
 
             base = sight.base
             scale = nav.metres_per_pixel(base.side, self.config.marker_size)
@@ -579,8 +621,8 @@ class Pilot:
                 offset = math.hypot(marker.x - sight.centre[0], marker.y - sight.centre[1])
                 if offset <= self.config.tol * sight.diagonal:
                     self.say("          над меткой {}".format(target_id))
-                    # Встали — заодно вернём высоту, если её увело.
-                    self.fly(0.0, 0.0, up, speed=self.config.climb_speed)
+                    # Встали — заодно вернём высоту и курс, если их увело.
+                    self.fly(0.0, 0.0, up, turn, speed=self.config.climb_speed)
                     return True
                 # GAIN < 1: не отрабатываем весь промах разом, иначе дрон
                 # проскакивает цель и качается от команды к команде.
@@ -600,7 +642,7 @@ class Pilot:
                         target_id, math.hypot(forward, left), confirmations,
                         self.config.blind_confirm))
                     if confirmations >= self.config.blind_confirm:
-                        self.fly(0.0, 0.0, up, speed=self.config.climb_speed)
+                        self.fly(0.0, 0.0, up, turn, speed=self.config.climb_speed)
                         return True
                     self.sleep(self.config.frame_pause)
                     continue
@@ -614,12 +656,12 @@ class Pilot:
                 if target_id in sight.seen:
                     self.say("          над меткой {} (остаток в мёртвой зоне)".format(
                         target_id))
-                    self.fly(0.0, 0.0, up, speed=self.config.climb_speed)
+                    self.fly(0.0, 0.0, up, turn, speed=self.config.climb_speed)
                     return True
-                self.fly(0.0, 0.0, up, speed=self.config.climb_speed)
+                self.fly(0.0, 0.0, up, turn, speed=self.config.climb_speed)
                 self.sleep(self.config.frame_pause)
                 continue
-            self.fly(move[0], move[1], up)
+            self.fly(move[0], move[1], up, turn)
             self.after_blind_climb = False
 
         self.say("          узел {} пропущен".format(target_id))
@@ -630,8 +672,11 @@ class Pilot:
         where = ("({:.2f}, {:.2f})".format(*sight.position)
                  if sight.position is not None else "?")
         height = " | h≈{:.2f} м".format(sight.altitude) if sight.altitude else ""
-        self.say("цель {:2d} | метки: {} | место {}{}".format(
-            target_id, ids, where, height))
+        drift = ""
+        if abs(sight.yaw_drift) >= self.config.yaw_warn:
+            drift = " | курс увело на {:+.0f}°".format(math.degrees(sight.yaw_drift))
+        self.say("цель {:2d} | метки: {} | место {}{}{}".format(
+            target_id, ids, where, height, drift))
 
     # -------------------------------------------------------------- взлёт
     def takeoff(self) -> None:
@@ -652,6 +697,9 @@ class Pilot:
         # высота считается относительно него.
         self.side_ref = side
         self.blind_up = 0.0
+        # Эталон курса: от него дальше считается увод. Сам курс не задаём —
+        # только измеряем, а исправляем лишь с --hold-yaw.
+        self.yaw_hold_ref = self.yaw_ref
         self.say(">>> ВЫСОТА {:.2f} м = метка {:.0f} px в кадре (эталон)".format(
             self.config.alt, side))
 
@@ -928,6 +976,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--micro-pause", type=float, default=default.micro_pause,
                         help="пауза между дроблёными командами, с; вместе с "
                              "--micro-step задаёт фактическую скорость")
+    parser.add_argument("--step-length", type=float, default=default.step_length,
+                        help="максимум дистанции на один замер по меткам, м — "
+                             "ограничивает увод курса за перелёт")
+    parser.add_argument("--hold-yaw", action="store_true",
+                        help="доворачивать курс к снятому после взлёта (по умолчанию "
+                             "курс только измеряется и печатается)")
+    parser.add_argument("--yaw-sign", type=float, default=default.yaw_sign,
+                        help="-1, если с --hold-yaw дрон закручивается сильнее")
     parser.add_argument("--station-height", type=float, default=default.station_height)
     parser.add_argument("--descent-step", type=float, default=default.descent_step)
     parser.add_argument("--touchdown-range", type=float, default=default.touchdown_range)
@@ -971,6 +1027,9 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         alt_fix=args.alt_fix,
         micro_step=args.micro_step,
         micro_pause=args.micro_pause,
+        step_length=args.step_length,
+        hold_yaw=args.hold_yaw,
+        yaw_sign=args.yaw_sign,
         station_height=args.station_height,
         descent_step=args.descent_step,
         touchdown_range=args.touchdown_range,
