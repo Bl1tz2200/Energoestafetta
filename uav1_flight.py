@@ -82,6 +82,13 @@ class MissionConfig:
     alt_fix: float = 0.3  # предел поправки высоты за одну команду, м
     alt_dead_zone: float = 0.05
     settle_s: float = 3.0  # запас на успокоение сверх времени набора высоты, с
+    # Как часто печатать место от aruco_map, пока дрон летит по одной команде
+    # и сценарий молчит (взлёт, перегон). 0 — не печатать. Нужно, чтобы
+    # отличить два очень разных отказа с одинаковым итогом: дрон сносит с
+    # первых сантиметров отрыва (PX4 нечем держать точку, пока карта не в
+    # кадре) или он стоит ровно, а позиция скачком меняется в момент, когда
+    # карта наконец распозналась (карта на платформе не та).
+    watch_period: float = 0.5
 
     # Смягчение перелёта: 0 — как в fly_head, вся дистанция одной командой.
     # Больше нуля — та же дистанция уходит лесенкой команд по micro_step через
@@ -122,6 +129,13 @@ class MissionConfig:
     # по координатам, а не по «вижу нужную метку».
     blind_markers: Tuple[int, ...] = (0, 5, 37, 48)
     start_tolerance: float = 0.7  # допуск сверки места со стартовой меткой, м
+    # Докуда уехавшего при взлёте дрона пробуем ВЕРНУТЬ на старт по карте
+    # (только в режиме aruco-map: там место известно точно, а команда задаётся
+    # абсолютной точкой). Это не ослабление start_tolerance: сам допуск
+    # остаётся прежним, просто проверяется он после возврата. 0 — не
+    # возвращать, прерывать сразу. Больше этого — дрон уехал слишком далеко,
+    # чтобы верить его позиции, и возврат сам по себе стал бы риском.
+    start_recover: float = 2.0
 
     station_height: float = 0.8  # высота куба станции, м
     descent_step: float = 0.15
@@ -300,7 +314,8 @@ class Pilot:
 
     # ------------------------------------------------------------ команда
     def fly(self, forward: float, left: float, up: float = 0.0, turn: float = 0.0, *,
-            speed: Optional[float] = None, auto_arm: bool = False) -> None:
+            speed: Optional[float] = None, auto_arm: bool = False,
+            watch: str = "") -> None:
         """Смещение по корпусу одной командой: x вперёд, y влево, z вверх.
 
         Ровно как ``fly()`` в проверенном в полёте ``fly_head.py`` (репозиторий
@@ -314,6 +329,10 @@ class Pilot:
         Сервис асинхронный, дождаться его можно только паузой: время в пути с
         учётом вертикали плюс запас ``hop_pad`` на разгон, торможение и
         успокоение. Снимок с ещё летящего дрона даёт промах и раскачку.
+
+        ``watch`` — метка для лога: с ней пауза идёт с трассировкой места по
+        ``aruco_map`` (см. ``pause``), и в логе видно, как дрон шёл, а не
+        только куда пришёл.
         """
         speed = speed if speed is not None else self.config.speed
         distance = math.hypot(forward, left)
@@ -329,14 +348,15 @@ class Pilot:
             distance = limit
 
         if self.config.micro_step > 0.0:
-            self._fly_ramped(forward, left, up, turn, speed, auto_arm)
+            self._fly_ramped(forward, left, up, turn, speed, auto_arm, watch)
             return
 
         self._navigate_once(forward, left, up, turn, speed, auto_arm)
-        self.sleep(math.hypot(distance, up) / max(speed, 0.05) + self.config.hop_pad)
+        self.pause(math.hypot(distance, up) / max(speed, 0.05) + self.config.hop_pad,
+                   watch)
 
     def _fly_ramped(self, forward: float, left: float, up: float, turn: float,
-                    speed: float, auto_arm: bool) -> None:
+                    speed: float, auto_arm: bool, watch: str = "") -> None:
         """Та же дистанция, но лесенкой команд по ``micro_step``.
 
         Смягчение на случай, если прошивка отрабатывает скачок цели рывком:
@@ -349,8 +369,32 @@ class Pilot:
         for index in range(pieces):
             self._navigate_once(forward / pieces, left / pieces, up / pieces,
                                 turn / pieces, speed, auto_arm and index == 0)
-            self.sleep(self.config.micro_pause)
-        self.sleep(self.config.hop_pad)
+            self.pause(self.config.micro_pause, watch)
+        self.pause(self.config.hop_pad, watch)
+
+    def pause(self, seconds: float, what: str = "") -> None:
+        """Пауза. С непустым ``what`` — с печатью места по ``aruco_map``.
+
+        Пока дрон отрабатывает одну команду, сценарий не делает ничего и в лог
+        не пишет — а увод происходит именно в эти секунды. Итоговая цифра
+        расхождения говорит только «уехал», и по ней не отличить снос с самого
+        отрыва от скачка позиции в момент, когда карта попала в кадр. Разбивка
+        паузы на куски по ``--watch-period`` показывает это прямо в логе.
+        """
+        period = self.config.watch_period
+        if not what or period <= 0.0 or seconds <= 0.0:
+            self.sleep(seconds)
+            return
+        spent = 0.0
+        while spent < seconds - 1e-6:
+            step = min(period, seconds - spent)
+            self.sleep(step)
+            spent += step
+            pose = self.read_map_pose()
+            self.say("          {} t={:4.1f}с: {}".format(
+                what, spent,
+                "aruco_map ({:+.2f}, {:+.2f}, {:.2f})".format(*pose[:3])
+                if pose else "aruco_map позиции нет"))
 
     def _navigate_once(self, forward: float, left: float, up: float, turn: float,
                        speed: float, auto_arm: bool) -> None:
@@ -682,7 +726,8 @@ class Pilot:
                 return True
 
             self._navigate_map(tx, ty)
-            self.sleep(distance / max(self.config.speed, 0.05) + self.config.hop_pad)
+            self.pause(distance / max(self.config.speed, 0.05) + self.config.hop_pad,
+                       "перегон к {}".format(target_id))
 
         self.say("          узел {} пропущен".format(target_id))
         return False
@@ -825,7 +870,8 @@ class Pilot:
         # набора: чем мягче взлёт, тем меньше раскачка наверху. Пауза — время
         # самого набора плюс запас на успокоение (как в fly_head).
         self.say("ВЗЛЁТ на {:.2f} м (frame_id='body', auto_arm=True)".format(self.config.alt))
-        self.fly(0.0, 0.0, self.config.alt, speed=self.config.climb_speed, auto_arm=True)
+        self.fly(0.0, 0.0, self.config.alt, speed=self.config.climb_speed,
+                 auto_arm=True, watch="взлёт")
         self.armed = True
 
         # Сверка места ПЕРВЫМ ЖЕ годным кадром, до долгого успокоения. Дрон,
@@ -1086,9 +1132,10 @@ def _run_mission_by_map(pilot: Pilot, route: Sequence[int]) -> bool:
                       start_xy[0], start_xy[1], error))
 
     pilot.say("ВЗЛЁТ на {:.2f} м (frame_id='body', auto_arm=True)".format(config.alt))
-    pilot.fly(0.0, 0.0, config.alt, speed=config.climb_speed, auto_arm=True)
+    pilot.fly(0.0, 0.0, config.alt, speed=config.climb_speed, auto_arm=True,
+              watch="взлёт")
     pilot.armed = True
-    pilot.sleep(config.settle_s)
+    pilot.pause(config.settle_s, "висим")
 
     # Главная сверка — уже в воздухе. Дрон, который не держит точку, уезжает
     # именно на этих секундах, и лететь по маршруту от неверного места нельзя.
@@ -1106,13 +1153,43 @@ def _run_mission_by_map(pilot: Pilot, route: Sequence[int]) -> bool:
                   pose[0], pose[1], pose[2], config.start_marker_id,
                   start_xy[0], start_xy[1], error))
     if error > config.start_tolerance:
-        raise FlightAborted(
-            "после взлёта дрон в ({:.2f}, {:.2f}), а стартовая метка {} — в "
-            "({:.2f}, {:.2f}): расхождение {:.2f} м больше --start-tolerance "
-            "{:.2f} м. Дрон не удержал точку — разбираться с оценкой положения "
-            "в PX4 (VPE), а не с флагами скрипта".format(
-                pose[0], pose[1], config.start_marker_id, start_xy[0], start_xy[1],
-                error, config.start_tolerance))
+        # Уехал. Но здесь, в отличие от режима markers, место известно точно, а
+        # команда задаётся абсолютной точкой карты — значит есть третий вариант
+        # между «лететь маршрут от неизвестно какого места» и «сажать исправный
+        # дрон». Возврат на старт заодно и есть проверка: дрон, который не может
+        # прийти в заданную точку карты, тем более не пройдёт маршрут.
+        if error > config.start_recover:
+            raise FlightAborted(
+                "после взлёта дрон в ({:.2f}, {:.2f}), а стартовая метка {} — в "
+                "({:.2f}, {:.2f}): расхождение {:.2f} м больше --start-recover "
+                "{:.2f} м. Так далеко уехавший дрон не возвращаем — разбираться "
+                "с оценкой положения в PX4 (VPE), а не с флагами скрипта".format(
+                    pose[0], pose[1], config.start_marker_id, start_xy[0], start_xy[1],
+                    error, config.start_recover))
+
+        pilot.say(">>> УЕХАЛ на {:.2f} м при взлёте — возвращаемся на старт {} "
+                  "по карте".format(error, config.start_marker_id))
+        if not pilot.goto_map(config.start_marker_id):
+            raise FlightAborted(
+                "вернуться на стартовую метку {} не удалось за {} попыток — дрон "
+                "не приходит в заданную точку карты, по маршруту его пускать "
+                "нельзя".format(config.start_marker_id, config.tries))
+        pilot.pause(config.settle_s, "висим")
+
+        pose = pilot.read_map_pose()
+        if pose is None:
+            raise FlightAborted("после возврата на старт позиция пропала")
+        error = math.hypot(pose[0] - start_xy[0], pose[1] - start_xy[1])
+        pilot.say(">>> ПОСЛЕ ВОЗВРАТА: ({:.2f}, {:.2f}, {:.2f}), расхождение "
+                  "{:.2f} м".format(pose[0], pose[1], pose[2], error))
+        if error > config.start_tolerance:
+            raise FlightAborted(
+                "после возврата дрон в ({:.2f}, {:.2f}), а стартовая метка {} — в "
+                "({:.2f}, {:.2f}): расхождение {:.2f} м больше --start-tolerance "
+                "{:.2f} м. Дрон не удерживает точку даже придя в неё — "
+                "разбираться с оценкой положения в PX4 (VPE)".format(
+                    pose[0], pose[1], config.start_marker_id, start_xy[0], start_xy[1],
+                    error, config.start_tolerance))
 
     for mid in route[:-1]:
         pilot.goto_map(mid)
@@ -1241,12 +1318,18 @@ def build_parser() -> argparse.ArgumentParser:
                              "станций, груз) — их камера не видит никогда; 'none' — нет таких")
     parser.add_argument("--start-tolerance", type=float, default=default.start_tolerance,
                         help="допуск сверки места со стартовой меткой после взлёта, м")
+    parser.add_argument("--start-recover", type=float, default=default.start_recover,
+                        help="докуда уехавшего при взлёте дрона возвращать на старт "
+                             "по карте перед сверкой, м (0 — не возвращать)")
     parser.add_argument("--blind-tolerance", type=float, default=default.blind_tolerance,
                         help="какой расчётный остаток считать «встали» над закрытой "
                              "меткой, м — поднимать, если дрон не может удержаться "
                              "точнее и миссия срывается у станции")
     parser.add_argument("--blind-confirm", type=int, default=default.blind_confirm,
                         help="столько кадров подряд остаток должен быть мал")
+    parser.add_argument("--watch-period", type=float, default=default.watch_period,
+                        help="как часто печатать место по aruco_map, пока дрон "
+                             "отрабатывает команду (взлёт, перегон), с; 0 — не печатать")
     parser.add_argument("--hop-pad", type=float, default=default.hop_pad)
     parser.add_argument("--hop-max-steps", type=float, default=default.hop_max_steps)
     parser.add_argument("--alt-fix", type=float, default=default.alt_fix,
@@ -1313,6 +1396,7 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         gain=args.gain,
         tol=args.tol,
         tries=args.tries,
+        watch_period=args.watch_period,
         hop_pad=args.hop_pad,
         hop_max_steps=args.hop_max_steps,
         alt_fix=args.alt_fix,
@@ -1328,6 +1412,7 @@ def config_from_args(args: argparse.Namespace) -> MissionConfig:
         tree_height=args.tree_height,
         blind_markers=_parse_blind_markers(args.blind_markers),
         start_tolerance=args.start_tolerance,
+        start_recover=args.start_recover,
         blind_tolerance=args.blind_tolerance,
         blind_confirm=args.blind_confirm,
         tree_clearance=args.tree_clearance,
