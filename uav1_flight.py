@@ -1145,13 +1145,11 @@ def run_probe(pilot: Pilot, *, cycles: int = 0) -> None:
         " -> ".join(str(mid) for mid in route)))
     print("метки читаются словарём {}; моторы не трогаем".format(config.aruco_dict))
     print()
-    print("ПРОВЕРКА ОСЕЙ (моторы выключены, дрон носим руками):")
-    for mid in (config.start_marker_id, ) + tuple(
-            m for m in (41, 47) if m in pilot.field and m != config.start_marker_id):
-        x, y = nav.marker_xy(pilot.field, mid)
-        print("  над меткой {:2d} ожидаем ({:.2f}, {:.2f})".format(mid, x, y))
-    print("  если x и y поменяны местами или растут не в ту сторону —")
-    print("  карта на платформе (map1.txt) не совпадает с config/field_map.txt")
+    print()
+    print("Это стационарная проверка зрения: дрон не взлетает и никуда не летит.")
+    print("Ставьте его РЯДОМ с метками (не на них) или держите над полем руками —")
+    print("метку прямо под собой он не видит: она либо закрыта, либо не влезает в кадр.")
+    print("Проверка направлений осей X/Y — отдельным скриптом: python3 debug_axes.py")
     print()
 
     count = 0
