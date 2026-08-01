@@ -36,8 +36,7 @@ PLAN.md) — обмен сигналами идёт через то, что ви
     # ... посадка, имитация зарядки ...
     proto.wait_for_takeoff_command()  # блокируется до команды оператора
 
-Пример на стороне станции (задача 2.1, ещё не реализована отдельным
-скриптом)::
+Пример на стороне станции (задача 2.1, реализована в ``charging_station.py``)::
 
     proto.wait_for_signal(proto.Signal.LANDING_REQUEST, read_drone_color,
                            timeout=120.0)
