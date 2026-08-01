@@ -531,44 +531,27 @@ def measured_grid_step(
 # ═══════════════════════════════════════════════════════════════════════
 
 
-class Hop(NamedTuple):
-    """Одна команда полёта: ось и величина. Больше в команде ничего нет."""
-
-    axis: str
-    value: float
-
-
-def hop_candidates(
+def limit_move(
     forward: float,
     left: float,
     *,
     limit: float = 1.5,
     dead_zone: float = 0.05,
-) -> List[Hop]:
-    """Варианты ОДНОЙ команды в порядке предпочтения: ось с большей ошибкой первой.
+) -> Optional[Tuple[float, float]]:
+    """Урезать перелёт до ``limit``, сохранив направление. None — лететь незачем.
 
-    Вторая ось не теряется — она гасится следующим кадром: контур замкнут по
-    меткам, позиция перечитывается перед каждой командой. ``limit`` режет
-    слишком длинный перелёт: он почти всегда означает, что опорная метка
-    опознана неверно, и лететь по нему целиком опасно.
-
-    Вариантов несколько, потому что команда идёт по осям КОРПУСА, а маршрут
-    проложен по осям ПОЛЯ: у развёрнутого дрона перелёт получается косым и
-    может пройти рядом с деревом. Тогда вызывающий берёт следующий вариант —
-    другую ось или укороченный шаг, — а не летит напролом.
+    Так же, как в ``fly_head.py``: вектор целиком, обе координаты сразу, и
+    урезается он пропорционально — направление при этом не меняется, меняется
+    только длина. Слишком длинный перелёт почти всегда означает, что опорная
+    метка опознана неверно, и лететь по нему целиком опасно: летим часть,
+    остаток доберёт следующий кадр (контур замкнут по меткам).
     """
-    order = (
-        (("x", forward), ("y", left))
-        if abs(forward) >= abs(left)
-        else (("y", left), ("x", forward))
-    )
-    variants: List[Hop] = []
-    for factor in (1.0, 0.5, 0.25):
-        for axis, value in order:
-            clipped = max(-limit, min(limit, value * factor))
-            if abs(clipped) >= dead_zone:
-                variants.append(Hop(axis, clipped))
-    return variants
+    distance = math.hypot(forward, left)
+    if distance < dead_zone:
+        return None
+    if distance > limit:
+        forward, left = forward * limit / distance, left * limit / distance
+    return forward, left
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -673,14 +656,14 @@ def _self_test() -> None:
     assert abs(x - drone[0]) < 1e-6 and abs(y - drone[1]) < 1e-6, (x, y)
     assert abs(measured_grid_step(seen, field, marker_size) - 1.0) < 1e-6
 
-    # Команда — ровно одна ось, длиннее предела не бывает, первый вариант —
-    # ось с большей ошибкой, запасные — другая ось и укороченный шаг.
-    variants = hop_candidates(1.0, 0.2)
-    assert variants[0] == Hop("x", 1.0), variants[0]
-    assert variants[1] == Hop("y", 0.2), variants[1]
-    assert all(abs(hop.value) <= 1.5 + 1e-9 for hop in variants)
-    assert hop_candidates(0.2, -2.0, limit=1.5)[0] == Hop("y", -1.5)
-    assert hop_candidates(0.01, -0.02) == []
+    # Перелёт отдаётся вектором целиком; урезание пропорционально, то есть
+    # направление сохраняется, а мелочь ниже мёртвой зоны командой не считается.
+    assert limit_move(1.0, 0.2) == (1.0, 0.2)
+    long_move = limit_move(3.0, 4.0, limit=1.5)
+    assert long_move is not None
+    assert abs(math.hypot(*long_move) - 1.5) < 1e-9, long_move
+    assert abs(long_move[0] / long_move[1] - 3.0 / 4.0) < 1e-9, long_move
+    assert limit_move(0.01, -0.02) is None
 
     print("marker_nav: самотест пройден")
 
