@@ -113,8 +113,8 @@ def describe_frame(
     else:
         ratio = step / grid_step
         note = "" if abs(ratio - 1.0) <= scale_tolerance else (
-            "  <-- МАСШТАБ ВРЁТ в {:.2f} раза: калибровка камеры или --marker-size"
-            .format(ratio))
+            "  <-- РАЗМЕР МЕТКИ не тот в {:.2f} раза: проверьте --marker-size "
+            "и померьте метку рулеткой".format(ratio))
         lines.append("шаг решётки: замер {:.2f} м, по карте {:.2f} м{}".format(
             step, grid_step, note))
 
@@ -240,7 +240,7 @@ def _self_test() -> None:
 
     # Неверный размер метки: все расстояния врут в одно и то же число раз.
     lines = describe_frame(seen, field, centre, marker_size * 1.5, grid)
-    assert any("МАСШТАБ ВРЁТ в 1.50 раза" in line for line in lines), lines
+    assert any("РАЗМЕР МЕТКИ не тот в 1.50 раза" in line for line in lines), lines
 
     # Одна метка: курс не измерить, места нет.
     lines = describe_frame({41: seen[41]}, field, centre, marker_size, grid)
