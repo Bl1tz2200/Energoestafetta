@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-"""Простой полёт БВС-1 до метки по её НОМЕРУ: взлёт на 2 м, перелёт, посадка.
+"""Полный сценарий БВС-1: взлёт, полёт к зарядке, зарядка, возврат, посадка.
 
-То же самое, что ``fly_to_station.py``, но цель задаётся не координатами, а
-номером ArUco-метки: ``python3 fly_to_marker.py 5``. Координаты скрипт
-находит сам в ``config/field_map.txt`` — при смене раскладки поля правится
-только карта, а код трогать не надо.
+Цель задаётся НОМЕРОМ ArUco-метки, координаты берутся из
+``config/field_map.txt``. Летим по прямой на 2 м (деревья на поле метровые,
+проходим сверху). Проверок нет: скрипт печатает, что происходит, но полёт
+ничем не прерывает.
 
-Никаких проверок: ни обхода деревьев, ни геозоны, ни спуска по дальномеру.
-Летим по прямой на 2 м (деревья на поле метровые, проходим сверху) и садимся
-штатным ``land()``.
+ЧТО ДЕЛАЕТ (шаги 1, 2, 3, 5 алгоритма из docs/TASK.md)
+-------------------------------------------------------
+1. взлёт на 2 м                          — лента ЖЁЛТАЯ МИГАЮЩАЯ
+2. полёт к зарядной станции              — лента КРАСНАЯ
+3. посадка на станцию, зарядка 15 с      — лента КРАСНАЯ МИГАЮЩАЯ,
+   за 5 с до взлёта                      — лента ЗЕЛЁНАЯ
+4. взлёт, возврат на старт, посадка      — лента ЗЕЛЁНАЯ МИГАЮЩАЯ
+5. лента гаснет
+
+Возврат начинается сам, сразу после зарядки: в регламенте он идёт «по команде
+с клавиатуры», но здесь никого не ждём — всё автономно от старта до посадки.
 
 Почему не ``frame_id='aruco_5'``: документация Skyris разрешает лететь прямо
 к метке (``navigate(frame_id='aruco_5', x=0, y=0, z=1)``), но фрейм ``aruco_N``
@@ -30,14 +38,15 @@
 
 3. Поставить дрон на площадку «Н» (метка 48) и запустить::
 
-       python3 fly_to_marker.py 5      # лететь к метке 5 (зарядка БВС-1)
-       python3 fly_to_marker.py        # без аргументов — к метке 5 с метки 48
+       python3 fly_to_marker.py 5      # к метке 5 (зарядка БВС-1) и обратно
+       python3 fly_to_marker.py        # без аргументов — то же самое
        python3 fly_to_marker.py 5 47   # взлетаем не с 48, а с метки 47
 
-Второй аргумент — метка, с которой взлетаем. На сам полёт он НЕ влияет: взлёт
-идёт в ``frame_id='body'`` («вверх оттуда, где стою»), а место дрон берёт у
-ноды ``aruco_map``. Нужен он только для сводки перед взлётом и чтобы после
-взлёта было видно, насколько дрон сошёл со стартовой метки.
+Второй аргумент — метка старта. Это ТОЧКА ВОЗВРАТА: именно в неё дрон летит
+после зарядки. На взлёт она не влияет (взлёт идёт в ``frame_id='body'`` —
+«вверх оттуда, где стою»), и видеть её камерой не нужно: место дрон берёт у
+ноды ``aruco_map`` по любым видимым меткам, а стартовую всё равно закрывает
+площадка «Н».
 
 Сводка «старт — цель — путь» печатается ДО взлёта. Если точки не те, жать
 Ctrl+C, дрон ещё стоит на земле.
@@ -64,9 +73,18 @@ CLIMB_SPEED = 1.0               # скорость набора высоты, м
 SPEED = 0.5                     # скорость перелёта, м/с
 TOLERANCE = 0.2                 # «долетели», м
 TIMEOUT = 40.0                  # дольше этого одну команду не ждём, с
+LANDING = 6.0                   # пауза на посадку и остановку моторов, с
+CHARGE = 15.0                   # имитация зарядки, с (по регламенту ~15 с)
+CHARGE_GREEN = 5.0              # из них последние — с зелёной лентой
 MAP = "config/field_map.txt"    # карта поля: id size x y z rot_z rot_y rot_x
 DEFAULT_MARKER = 5              # метка зарядной станции БВС-1
-DEFAULT_START = 48              # метка площадки «Н», с которой взлетаем
+DEFAULT_START = 48              # метка площадки «Н»: взлёт и точка возврата
+
+# Цвета ленты по регламенту (docs/TASK.md, шаги 1-5)
+YELLOW = (255, 255, 0)
+RED = (255, 0, 0)
+GREEN = (0, 255, 0)
+OFF = (0, 0, 0)
 
 # ─── откуда и куда ────────────────────────────────────────────────────────
 # Считаем до подключения к дрону: опечатка в номере метки выясняется на земле,
@@ -80,12 +98,15 @@ start_x, start_y = nav.marker_xy(field, start)
 route_length = math.hypot(target_x - start_x, target_y - start_y)
 
 print("─" * 58)
-print("старт  метка {:>2} -> ({:.1f}, {:.1f})".format(start, start_x, start_y))
+print("старт  метка {:>2} -> ({:.1f}, {:.1f})   (и точка возврата)".format(
+    start, start_x, start_y))
 print("цель   метка {:>2} -> ({:.1f}, {:.1f})".format(target, target_x, target_y))
-print("путь   {:.2f} м по прямой, ~{:.0f} с на {:.1f} м/с".format(
+print("путь   {:.2f} м в одну сторону, ~{:.0f} с на {:.1f} м/с".format(
     route_length, route_length / SPEED, SPEED))
 print("высота {:.1f} м, взлёт ~{:.0f} с на {:.1f} м/с".format(
     ALT, ALT / CLIMB_SPEED, CLIMB_SPEED))
+print("зарядка {:.0f} с, из них последние {:.0f} с — зелёная лента".format(
+    CHARGE, CHARGE_GREEN))
 print("─" * 58)
 
 # ─── подключение к дрону ──────────────────────────────────────────────────
@@ -94,6 +115,20 @@ rospy.init_node("fly_to_marker")
 navigate = rospy.ServiceProxy("navigate", srv.Navigate)
 get_telemetry = rospy.ServiceProxy("get_telemetry", srv.GetTelemetry)
 land = rospy.ServiceProxy("land", Trigger)
+set_effect = rospy.ServiceProxy("led/set_effect", srv.SetLEDEffect)
+
+
+def led(effect, color, what):
+    """Лента: ``effect`` — fill/blink/fade/flash/rainbow, ``color`` — (r, g, b).
+
+    Отказ ленты полёт не прерывает: балл за индикацию потеряется, но дрон
+    висит в воздухе и его надо посадить.
+    """
+    print("  лента: {}".format(what))
+    try:
+        set_effect(effect=effect, r=color[0], g=color[1], b=color[2])
+    except Exception as error:
+        print("  лента не отозвалась:", error)
 
 
 def navigate_wait(x=0.0, y=0.0, z=0.0, speed=SPEED, frame_id="body", auto_arm=False):
@@ -127,16 +162,46 @@ def report(what, mark, mark_x, mark_y):
         what, telemetry.x, telemetry.y, telemetry.z, mark, away))
 
 
-# ─── полёт ────────────────────────────────────────────────────────────────
-print("взлёт на {:.1f} м".format(ALT))
+# ─── 1. взлёт ─────────────────────────────────────────────────────────────
+print("ВЗЛЁТ на {:.1f} м".format(ALT))
+led("blink", YELLOW, "жёлтая мигающая — взлёт")
 navigate_wait(z=ALT, speed=CLIMB_SPEED, frame_id="body", auto_arm=True)
 rospy.sleep(3.0)  # повисеть, дать нодам увидеть карту меток
 report("НАЧАЛО", start, start_x, start_y)
 
-print("летим к метке {}".format(target))
+# ─── 2. полёт к зарядной станции ──────────────────────────────────────────
+print("ЛЕТИМ к метке {} (зарядная станция)".format(target))
+led("fill", RED, "красная — ищем зарядную станцию")
 navigate_wait(x=target_x, y=target_y, z=ALT, frame_id="aruco_map")
 rospy.sleep(3.0)
-report("КОНЕЦ ", target, target_x, target_y)
+report("НАД СТАНЦИЕЙ", target, target_x, target_y)
 
-print("посадка")
+# ─── 3. посадка на станцию и зарядка ──────────────────────────────────────
+print("ПОСАДКА на станцию")
 land()
+rospy.sleep(LANDING)
+
+print("ЗАРЯДКА {:.0f} с".format(CHARGE))
+led("blink", RED, "красная мигающая — идёт зарядка")
+rospy.sleep(CHARGE - CHARGE_GREEN)
+led("fill", GREEN, "зелёная — {:.0f} с до взлёта".format(CHARGE_GREEN))
+rospy.sleep(CHARGE_GREEN)
+
+# ─── 4. возврат на старт и посадка ────────────────────────────────────────
+print("ЗАРЯДКА ОКОНЧЕНА, летим домой")
+print("ВЗЛЁТ со станции")
+led("blink", GREEN, "зелёная мигающая — возвращаемся")
+navigate_wait(z=ALT, speed=CLIMB_SPEED, frame_id="body", auto_arm=True)
+rospy.sleep(3.0)
+
+print("ВОЗВРАТ к метке {}".format(start))
+navigate_wait(x=start_x, y=start_y, z=ALT, frame_id="aruco_map")
+rospy.sleep(3.0)
+report("ДОМА", start, start_x, start_y)
+
+print("ПОСАДКА")
+land()
+rospy.sleep(LANDING)
+
+led("fill", OFF, "гасим — миссия окончена")
+print("ГОТОВО")
