@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """Проверка осей карты: совпадают ли X и Y у aruco_map с физическим полем.
 
-Моторы не включаются. Дрон носят руками и ставят по очереди на три метки:
-начало координат, «метка по оси X» и «метка по оси Y». Скрипт снимает
-позицию с ``get_telemetry(frame_id='aruco_map')`` в каждой точке и сам ставит
-диагноз: оси совпадают, перепутаны местами, направлены в обратную сторону,
-карта зеркальная или врёт масштаб.
+Моторы не включаются. Дрон держат руками **над** тремя метками по очереди:
+начало координат, «метка по оси X» и «метка по оси Y». Скрипт снимает позицию
+с ``get_telemetry(frame_id='aruco_map')`` в каждой точке и сам ставит диагноз:
+оси совпадают, перепутаны местами, направлены в обратную сторону, карта
+зеркальная, повёрнутая, чужая или врёт масштаб.
+
+Метку под собой дрон при этом **не видит и видеть не должен** — с 10 см она не
+влезает в кадр целиком, а стоя на площадке он её просто закрывает. Это не
+мешает: ``aruco_map`` считает позицию по ЛЮБЫМ видимым меткам поля, поэтому
+вопрос к платформе стоит не «видишь ли ты метку N», а «какие у тебя сейчас
+координаты». Держать дрон нужно примерно в полуметре над меткой, камерой ровно
+над её центром: так в кадр попадает несколько соседних меток и решение
+устойчивее, чем с пола.
 
 Зачем это нужно. Кадр карты в ROS — ENU, правая тройка (docs Clover,
 «Map-based navigation with ArUco markers»). Если карта на платформе задана
@@ -122,8 +130,10 @@ def diagnose(
     expected_x: Tuple[float, float],
     expected_y: Tuple[float, float],
     *,
+    origin_error: Optional[float] = None,
     angle_tolerance: float = 20.0,
     scale_tolerance: float = 0.2,
+    origin_tolerance: float = 0.5,
 ) -> Tuple[bool, List[str]]:
     """Сравнить измеренные направления осей с ожидаемыми по карте.
 
@@ -133,6 +143,17 @@ def diagnose(
     """
     report: List[str] = []
     ok = True
+
+    # Смещение начала координат — самый прямой признак «на платформе другая
+    # карта». Направления осей могут совпасть случайно (обе карты правые), а
+    # вот начало отсчёта у чужой карты почти наверняка в другом месте.
+    wrong_origin = origin_error is not None and origin_error > origin_tolerance
+    if wrong_origin:
+        ok = False
+        report.append(
+            "НАЧАЛО КООРДИНАТ не совпало: над стартовой меткой платформа "
+            "показывает точку в {:.2f} м от нуля карты. Это значит, что нода "
+            "aruco_map читает ДРУГОЙ файл карты, а не наш".format(origin_error))
 
     len_measured_x = math.hypot(*measured_x)
     len_measured_y = math.hypot(*measured_y)
@@ -170,15 +191,24 @@ def diagnose(
     if abs(angle_x) <= angle_tolerance and abs(angle_y) <= angle_tolerance:
         if ok:
             report.append("ОСИ СОВПАДАЮТ: карта на платформе соответствует полю")
+        elif wrong_origin:
+            report.append("направления осей верные — расходится только начало отсчёта")
         return ok, report
 
     ok = False
     if measured_cross * expected_cross < 0 and abs(abs(angle_x) - 90.0) <= angle_tolerance:
         report.append("X и Y ПЕРЕПУТАНЫ МЕСТАМИ (это и есть зеркальность через обмен осей)")
     elif abs(nav.wrap_angle(math.radians(angle_x - angle_y))) <= math.radians(angle_tolerance):
-        report.append(
-            "карта ПОВЁРНУТА на {:+.0f}° целиком (обе оси уехали одинаково) — "
-            "скорее всего поле развёрнуто относительно карты".format((angle_x + angle_y) / 2))
+        turn = (angle_x + angle_y) / 2
+        if wrong_origin:
+            report.append(
+                "карта ПОВЁРНУТА на {:+.0f}° целиком и начало отсчёта другое — "
+                "это чужая карта (наша дала бы 0° и совпавший ноль)".format(turn))
+        else:
+            report.append(
+                "карта ПОВЁРНУТА на {:+.0f}° целиком (обе оси уехали одинаково), "
+                "а начало отсчёта совпало — поле физически развёрнуто "
+                "относительно нумерации".format(turn))
     if abs(abs(angle_x) - 180.0) <= angle_tolerance:
         report.append("ось X направлена В ОБРАТНУЮ сторону")
     if abs(abs(angle_y) - 180.0) <= angle_tolerance:
@@ -207,10 +237,11 @@ def run(
     poses: List[Pose] = []
 
     print("Проверка осей карты. Моторы не включаются, дрон носим руками.")
-    print("Ставить дрон ровно на метку, ноутбук держать рядом.\n")
+    print("Держите дрон примерно в 0.5 м НАД меткой, камерой над её центром:")
+    print("саму метку под собой он не увидит, позиция считается по соседним.\n")
     for label, mid in zip(labels, markers):
         expected = nav.marker_xy(field, mid)
-        wait_fn("  {}: поставьте дрон на метку {} (ожидаем {:.2f}, {:.2f}) "
+        wait_fn("  {}: держите дрон над меткой {} (ожидаем {:.2f}, {:.2f}) "
                 "и нажмите Enter...".format(label, mid, expected[0], expected[1]))
         measured = average_pose(read, samples, pause, sleep_fn=sleep_fn)
         if measured is None:
@@ -220,6 +251,11 @@ def run(
         pose, spread = measured
         print("    замер: ({:+.2f}, {:+.2f}, {:+.2f}), курс {:+.0f}°, разброс {:.2f} м"
               .format(pose[0], pose[1], pose[2], math.degrees(pose[3]), spread))
+        if not math.isnan(pose[2]) and pose[2] < -0.05:
+            print("    !!! z отрицательный ({:+.2f} м): дрон физически ВЫШЕ плоскости "
+                  "меток, а "
+                  "карта считает его ниже. Карта на платформе задана для потолка "
+                  "или это вообще не наша карта".format(pose[2]))
         if spread > 0.15:
             print("    !!! позиция скачет на {:.2f} м — сравнивать оси рано, "
                   "сначала разберитесь с этим".format(spread))
@@ -240,8 +276,13 @@ def run(
         origin_id, axis_y_id, expected_y[0], expected_y[1]))
     print("по замеру: X = ({:+.2f}, {:+.2f}), Y = ({:+.2f}, {:+.2f})".format(
         measured_x[0], measured_x[1], measured_y[0], measured_y[1]))
+    origin_error = math.hypot(origin[0] - map_origin[0], origin[1] - map_origin[1])
+    print("начало координат: по карте ({:+.2f}, {:+.2f}), по замеру ({:+.2f}, {:+.2f}), "
+          "расхождение {:.2f} м".format(
+              map_origin[0], map_origin[1], origin[0], origin[1], origin_error))
 
-    ok, report = diagnose(measured_x, measured_y, expected_x, expected_y)
+    ok, report = diagnose(measured_x, measured_y, expected_x, expected_y,
+                          origin_error=origin_error)
     for line in report:
         print("  " + line)
     if not ok:
@@ -285,6 +326,21 @@ def _self_test() -> None:
     ok, report = diagnose((1.4, 0.0), (0.0, 1.4), expected_x, expected_y)
     assert not ok
     assert any("МАСШТАБ" in line for line in report), report
+
+    # Чужая карта: направления совпали, но начало отсчёта в другом месте.
+    ok, report = diagnose((1.0, 0.0), (0.0, 1.0), expected_x, expected_y,
+                          origin_error=1.7)
+    assert not ok
+    assert any("НАЧАЛО КООРДИНАТ не совпало" in line for line in report), report
+    assert any("направления осей верные" in line for line in report), report
+
+    # Реальный замер с площадки 2026-08-01: карта повёрнута на +92° И начало
+    # другое — значит нода читает чужой файл, а не наш.
+    ok, report = diagnose((-0.02, 0.90), (-1.20, -0.07), expected_x, expected_y,
+                          origin_error=1.65)
+    assert not ok
+    assert any("чужая карта" in line for line in report), report
+    assert not any("ЗЕРКАЛЬНАЯ" in line for line in report), report
 
     # Шум в пределах допуска не должен поднимать тревогу.
     ok, report = diagnose((0.98, 0.05), (-0.04, 1.03), expected_x, expected_y)
