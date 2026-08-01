@@ -19,6 +19,89 @@ python3 lib/marker_nav.py --map config/field_map.txt   # показать дер
 Ставьте дрон носом вдоль ряда меток (любой разворот кратно 90°): тогда каждый
 перегон — одна команда вместо двух, миссия короче примерно на 20 секунд.
 
+### Шпаргалка: все команды
+
+Всё, что вообще запускается в этом репозитории. Подробности по каждому пункту
+— в разделах ниже.
+
+**На ноутбуке, без ROS и дрона**
+
+```bash
+python3 lib/marker_nav.py --self-test                  # самотест расчётов
+python3 lib/marker_nav.py --map config/field_map.txt   # деревья и маршрут
+python3 lib/marker_nav.py --map config/field_map.txt \
+    --start-marker 48 --station-marker 5 --tree-clearance 0.8   # маршрут при другом зазоре
+python3 lib/led_interface.py --self-test               # самотест LED
+python3 uav1_flight.py --help                          # все флаги со значениями
+```
+
+**Перенос кода на Orange Pi**
+
+```bash
+ssh orangepi@<ip-бвс> 'cd ~/energoestafetta && git pull'          # вариант А
+rsync -avz --exclude '__pycache__' --exclude '*.pyc' \
+    ./ orangepi@<ip-бвс>:~/energoestafetta/                       # вариант Б
+ssh orangepi@<ip-бвс> 'cd ~/energoestafetta && python3 lib/marker_nav.py --self-test'
+```
+
+**На борту: окружение и проверка без моторов**
+
+```bash
+source /opt/ros/noetic/setup.bash        # только в неинтерактивном контексте:
+source ~/technic_ws/devel/setup.bash     # при входе по SSH это делается само
+
+python3 uav1_flight.py --probe --map config/field_map.txt   # зрение, моторы не трогаем
+python3 uav1_flight.py --probe --aruco-dict DICT_4X4_100    # если метки не распознаются
+chmod +x uav1_flight.py lib/marker_nav.py lib/led_interface.py   # если нужен ./запуск
+```
+
+**Полёт**
+
+```bash
+# короткий маршрут — первый вылет после любой правки: одна метка от старта.
+# Куба там нет, поэтому дрон сядет на пол и напишет «похоже, под дроном пол»:
+# проверяется только перелёт, а не посадка на станцию
+python3 uav1_flight.py --map config/field_map.txt --station-marker 41
+
+# боевой запуск
+python3 uav1_flight.py --map config/field_map.txt \
+    --start-marker 48 --station-marker 5 --station-height 0.8
+
+# осторожный: медленнее, мягче доводка, больше попыток
+python3 uav1_flight.py --map config/field_map.txt \
+    --speed 0.2 --gain 0.5 --hop-pad 1.2 --tries 12
+
+# лог в файл и на экран одновременно
+python3 uav1_flight.py --map config/field_map.txt 2>&1 | tee ~/log_uav1.txt
+```
+
+`Ctrl+C` в терминале — штатный способ прервать попытку: дрон гасит движение и
+садится. KILL SWITCH на пульте остаётся последним средством.
+
+**Разбор проблем**
+
+```bash
+# дрон летит рывками, --speed не помогает: дробить перелёт
+python3 uav1_flight.py --map config/field_map.txt --micro-step 0.06
+
+# в логе «курс увело на N°»: включить удержание курса
+python3 uav1_flight.py --map config/field_map.txt --hold-yaw
+python3 uav1_flight.py --map config/field_map.txt --hold-yaw --yaw-sign -1   # если стало хуже
+
+# миссия срывается у станции («над станцией встать не удалось»)
+python3 uav1_flight.py --map config/field_map.txt \
+    --blind-tolerance 0.25 --blind-confirm 2
+
+# кроны деревьев шире ожидаемого — маршрут в обход
+python3 uav1_flight.py --map config/field_map.txt --tree-clearance 0.8
+
+# другая раскладка поля (метки объявляют перед попыткой)
+python3 uav1_flight.py --map config/field_map.txt \
+    --start-marker 42 --station-marker 37 \
+    --blind-markers 0,5,37,42 \
+    --tree-markers 12,13,19,20 --tree-markers 9,10,16,17
+```
+
 ### Все флаги `uav1_flight.py`
 
 #### Поле и цели
