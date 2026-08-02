@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""Полный сценарий БВС-1: взлёт, полёт к зарядке, зарядка, возврат, посадка.
+
+Цель задаётся НОМЕРОМ ArUco-метки, координаты берутся из
+``config/field_map.txt``. Летим по прямой на 2 м (деревья на поле метровые,
+проходим сверху). Своих проверок полёта нет: скрипт печатает, что происходит,
+но траекторию ничем не прерывает.
+
+ЧТО ДЕЛАЕТ (шаги 1, 2, 3, 5 алгоритма из docs/TASK.md)
+-------------------------------------------------------
+1. взлёт на 2 м                          — лента ЖЁЛТАЯ МИГАЮЩАЯ
+2. полёт к зарядной станции              — лента КРАСНАЯ
+3. запрос посадки у станции, ожидание    — лента КРАСНАЯ (по ней станция
+   разрешения                              и опознаёт борт)
+4. посадка, зарядка 15 с                 — лента КРАСНАЯ МИГАЮЩАЯ,
+   за 5 с до взлёта                      — лента ЗЕЛЁНАЯ
+5. ожидание команды оператора (Enter)    — лента ЗЕЛЁНАЯ
+6. взлёт, возврат на старт, посадка      — лента ЗЕЛЁНАЯ МИГАЮЩАЯ
+7. выключение моторов, лента гаснет
+
+Шаги 3, 5 и 7 — требования регламента: посадка «по команде от станции»
+(TASK.md, шаг 3), возврат «после зарядки и команды с клавиатуры» (шаг 5) и
+автономное выключение моторов (1 балл).
+
+ГЛАВНОЕ ПРАВИЛО ОЖИДАНИЙ: у каждого ожидания есть срок, и по его истечении
+дрон идёт ДАЛЬШЕ ПО СЦЕНАРИЮ, а не зависает. Молчащая станция — не повод
+висеть над кубом, пока не сядет батарея; отсутствие оператора — не повод
+ночевать на станции. В воздухе дрон ждёт только на шаге 3 и не дольше 20 с.
+
+Почему не ``frame_id='aruco_5'``: документация Skyris разрешает лететь прямо
+к метке (``navigate(frame_id='aruco_5', x=0, y=0, z=1)``), но фрейм ``aruco_N``
+живёт, только пока метка видна в кадре. Метку зарядной станции закрывает куб —
+она не появится в кадре никогда. Поэтому номер переводим в координаты по карте
+и летим в ``aruco_map``.
+
+ЗАПУСК НА ДРОНЕ
+---------------
+1. Скопировать на борт файл и карту поля::
+
+       scp uav1_flight.py orangepi@10.42.0.1:~
+       scp -r config orangepi@10.42.0.1:~
+
+2. Зайти на борт и подготовить окружение::
+
+       ssh orangepi@10.42.0.1
+       source /opt/ros/noetic/setup.bash
+
+3. Поставить дрон на площадку «Н» (метка 48) и запустить::
+
+       python3 uav1_flight.py --station 192.168.0.21   # боевой запуск
+       python3 uav1_flight.py 5      # к метке 5 (зарядка БВС-1) и обратно
+       python3 uav1_flight.py        # без аргументов — то же самое
+       python3 uav1_flight.py 5 47   # взлетаем не с 48, а с метки 47
+
+``--station`` — IP зарядной станции. Без него дрон летит и садится сам, не
+спрашивая разрешения; связь с этого момента считается выключенной на всю
+попытку. Порядок аргументов любой: флаги вырезаются до позиционных.
+
+``--check`` — проверка без моторов И БЕЗ ROS: читает карту, печатает сводку,
+проверяет связь со станцией и выходит. Единственный способ проверить скрипт
+не на дроне, в том числе после переноса::
+
+       python3 uav1_flight.py --check --station 192.168.0.21
+
+Третий аргумент — своя карта поля, для проверки в Gazebo с другой раскладкой::
+
+       python3 uav1_flight.py 12 0 ~/catkin_ws/src/my_field.txt
+
+Карту надо брать ИЗ ТОГО ЖЕ файла, который скормлен ноде ``aruco_map``
+(проверить: ``rosparam get /aruco_map/map``). Если файлы разные, дрон считает
+место по одной раскладке, а летит по другой — и уверенно улетает не туда.
+
+Второй аргумент — метка старта. Это ТОЧКА ВОЗВРАТА: именно в неё дрон летит
+после зарядки. На взлёт она не влияет (взлёт идёт в ``frame_id='body'`` —
+«вверх оттуда, где стою»), и видеть её камерой не нужно: место дрон берёт у
+ноды ``aruco_map`` по любым видимым меткам, а стартовую всё равно закрывает
+площадка «Н».
+
+Сводка «старт — цель — путь» печатается ДО взлёта. Если точки не те, жать
+Ctrl+C, дрон ещё стоит на земле.
+
+Пульт держать в руках: аварийный переход в ручной режим — только с него.
+"""
+
+import json
+import math
+import os
+import select
+import socket
+import sys
+import time
+
+# ROS импортируется НЕ здесь, а ниже, после разбора аргументов и проверки
+# связи со станцией. Благодаря этому `--check` работает на любой машине, где
+# есть python3, — в том числе на ноутбуке без ROS.
+
+# ─── настройки ────────────────────────────────────────────────────────────
+ALT = 2.0                       # рабочая высота, м. Деревья метровые — 2 м их проходят
+CLIMB_SPEED = 1.0               # скорость набора высоты, м/с
+SPEED = 0.5                     # скорость перелёта, м/с
+TOLERANCE = 0.2                 # «долетели», м
+TIMEOUT = 40.0                  # дольше этого одну команду не ждём, с
+LANDING = 6.0                   # пауза на посадку и остановку моторов, с
+CHARGE = 15.0                   # имитация зарядки, с (по регламенту ~15 с)
+CHARGE_GREEN = 5.0              # из них последние — с зелёной лентой
+MAP = "config/field_map.txt"    # карта поля: id size x y z rot_z rot_y rot_x
+DEFAULT_MARKER = 5              # метка зарядной станции БВС-1
+DEFAULT_START = 48              # метка площадки «Н»: взлёт и точка возврата
+
+# Цвета ленты по регламенту (docs/TASK.md, шаги 1-5)
+YELLOW = (255, 255, 0)
+RED = (255, 0, 0)
+GREEN = (0, 255, 0)
+OFF = (0, 0, 0)
+
+# ─── связь с зарядной станцией ────────────────────────────────────────────
+# Формат датаграмм совместим с lib/station_link.py из ветки charging-station:
+# менять ключи, порт и имена узлов в одностороннем порядке нельзя, иначе
+# станция перестанет понимать борт.
+STATION_PORT = 5801     # один и тот же порт с обеих сторон
+NODE_ID = "uav1"        # как нас зовёт станция в своём --drone uav1=<наш ip>
+STATION_ID = "station1" # --id станции; не совпадёт — она отбросит наши пакеты
+PROTO_V = 1             # версия протокола, чужие версии отбрасываются
+REPEAT = 3              # каждое сообщение уходит трижды: UDP теряет пакеты
+WAIT_HELLO = 2.0        # проверка связи на земле, с
+WAIT_STATION = 20.0     # ждём разрешения на посадку, дальше садимся сами, с
+ASK_INTERVAL = 0.5      # как часто повторяем запрос посадки, с
+WAIT_OPERATOR = 60.0    # ждём команду оператора на возврат, с
+
+# ─── карта поля ───────────────────────────────────────────────────────────
+# Перенесено из бывшего lib/marker_nav.py: это всё, что от него было нужно.
+# Отдельного модуля больше нет — скрипт возят на борт одним файлом.
+
+
+def read_field_map(path):
+    """Карта поля в формате aruco_pose: ``id size x y z rot_z rot_y rot_x``.
+
+    Возвращает ``{id: (x, y)}``. Высота меток не нужна: они все лежат на полу.
+    Углы поворота тоже не нужны нам — но нужны ноде ``aruco_map``, поэтому
+    файл общий, и колонки после ``y`` мы просто пропускаем.
+    """
+    field = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            row = line.split("#", 1)[0].split()
+            if not row:
+                continue
+            if len(row) < 4:
+                raise ValueError(
+                    "{}:{}: ожидалось 'id size x y ...', получено {!r}".format(
+                        path, line_number, line.strip()
+                    )
+                )
+            field[int(row[0])] = (float(row[2]), float(row[3]))
+    if not field:
+        raise ValueError("Карта поля пуста: " + path)
+    return field
+
+
+def marker_xy(field, mid):
+    """Координаты метки по карте. Нет такой метки — понятная ошибка, не KeyError."""
+    if mid not in field:
+        raise SystemExit("Метки {} нет в карте поля".format(mid))
+    return field[mid]
+
+
+# ─── разговор со станцией ─────────────────────────────────────────────────
+# Одноранговый UDP: сервера нет, обе стороны слушают один порт и шлют
+# датаграммы прямо на IP собеседника. Порядок включения не важен, выключенная
+# станция ничего не вешает — у UDP нет установки соединения.
+#
+# Станция опознаёт борт ПО IP отправителя, поэтому на её стороне нужен наш
+# адрес (`--drone uav1=<ip дрона>`), а нам её — флагом `--station <ip>`.
+
+sock = None          # UDP-сокет или None, если связи нет
+station_ip = ""      # адрес станции из --station
+session = ""         # идентификатор запуска: отличает наши пакеты от старых
+seq = 0              # номер сообщения, растёт
+
+
+def station_open(ip):
+    """Поднять UDP-сокет. Вернуть True, если связь есть.
+
+    Любая неудача — не отказ миссии, а полёт без станции: разрешение на
+    посадку тогда не спрашивается, а доклады не отправляются.
+    """
+    global sock, session
+    if not ip:
+        print("станция: адрес не задан (--station), летим без неё")
+        return False
+    try:
+        made = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        made.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Бинд именно на STATION_PORT: станция отвечает на этот порт, ответ
+        # на случайный эфемерный до нас не дойдёт.
+        made.bind(("0.0.0.0", STATION_PORT))
+    except OSError as error:
+        print("станция: порт {} занять не вышло ({}), летим без неё".format(
+            STATION_PORT, error))
+        return False
+    sock = made
+    session = os.urandom(3).hex()
+    print("станция: {}:{}, мы {} (сессия {})".format(ip, STATION_PORT, NODE_ID, session))
+    return True
+
+
+def station_send(kind, data=None):
+    """Отправить сообщение станции. Молча ничего не делает, если связи нет."""
+    global seq
+    if sock is None:
+        return
+    seq += 1
+    payload = json.dumps(
+        {
+            "v": PROTO_V,
+            "kind": kind,
+            "from": NODE_ID,
+            "to": STATION_ID,
+            "seq": seq,
+            "sid": session,
+            "data": data or {},
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    for _ in range(REPEAT):  # UDP теряет пакеты, повтор дешевле подтверждений
+        try:
+            sock.sendto(payload, (station_ip, STATION_PORT))
+        except OSError as error:
+            print("  станция: отправить {} не вышло ({})".format(kind, error))
+            return
+
+
+def station_recv(timeout):
+    """Ждать сообщение от станции не дольше ``timeout``.
+
+    Возвращает ``(kind, data)`` или ``None``. Чужие и битые датаграммы
+    отбрасываются молча: порт общий, чужой трафик на нём — норма, а не сбой.
+    """
+    if sock is None:
+        return None
+    deadline = time.time() + timeout
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            return None
+        ready, _, _ = select.select([sock], [], [], left)
+        if not ready:
+            return None
+        try:
+            payload, source = sock.recvfrom(4096)
+        except OSError:
+            return None
+        if source[0] != station_ip:
+            continue
+        try:
+            raw = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if not isinstance(raw, dict) or raw.get("v") != PROTO_V:
+            continue
+        if raw.get("from") == NODE_ID:      # эхо собственной датаграммы
+            continue
+        target_id = raw.get("to")
+        if target_id and target_id != NODE_ID:
+            continue
+        kind = raw.get("kind")
+        if not isinstance(kind, str):
+            continue
+        data = raw.get("data")
+        return kind, data if isinstance(data, dict) else {}
+
+
+def station_hello():
+    """Проверка связи на земле. Ответа нет — предупреждаем, но летим."""
+    if sock is None:
+        return False
+    station_send("hello")
+    answer = station_recv(WAIT_HELLO)
+    if answer is None:
+        print("станция: не отвечает на hello — проверьте, что процесс поднят")
+        print("  и что на роутере выключена изоляция клиентов")
+        return False
+    print("станция: связь есть (ответ {})".format(answer[0]))
+    return True
+
+
+def ask_landing():
+    """Запросить у станции разрешение на посадку (docs/TASK.md, шаг 3).
+
+    Возвращает True, если разрешили. Молчание или отказ дольше WAIT_STATION —
+    False, и это НЕ повод отменять посадку: дрон висит над кубом, топливо
+    тратится, и садиться всё равно надо. Ждать вечно нельзя.
+    """
+    if sock is None:
+        return False
+    deadline = time.time() + WAIT_STATION
+    said = 0.0
+    while time.time() < deadline:
+        station_send("landing_request", {"color": "red"})
+        answer = station_recv(ASK_INTERVAL)
+        if answer is not None:
+            kind, data = answer
+            if kind == "landing_granted":
+                return True
+            if kind == "landing_denied":
+                print("  станция отказала: {}".format(data.get("reason", "без причины")))
+        if time.time() - said > 5.0:
+            said = time.time()
+            print("  станция молчит, ждём ещё {:.0f} с".format(deadline - time.time()))
+    return False
+
+
+def wait_enter(timeout=WAIT_OPERATOR):
+    """Ждать команду оператора на возврат: Enter или ``go`` (docs/TASK.md, шаг 5).
+
+    Возвращает True, если дождались. Дрон в это время стоит на станции с
+    выключенными моторами, поэтому ожидание безопасно — но не бесконечно:
+    попытка ограничена по времени регламентом, и по истечении срока летим
+    домой сами. Не терминал (nohup/systemd) — не ждём вообще.
+    """
+    if not sys.stdin.isatty():
+        print("ввод не с терминала — возвращаемся без команды")
+        return False
+    print("ЖДЁМ КОМАНДУ на возврат: Enter (или 'go'), до {:.0f} с".format(timeout))
+    deadline = time.time() + timeout
+    said = 0.0
+    while time.time() < deadline:
+        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+        if ready:
+            line = sys.stdin.readline()
+            if line == "":       # EOF: ввод закрыт
+                return False
+            if line.strip().lower() in ("", "go", "го", "взлёт"):
+                return True
+            print("  не понял «{}» — жму Enter для взлёта".format(line.strip()))
+        if time.time() - said > 5.0:
+            said = time.time()
+            print("  жду команды, осталось {:.0f} с".format(deadline - time.time()))
+    return False
+
+
+# ─── разбор аргументов ────────────────────────────────────────────────────
+# Флаги вырезаются до позиционных, поэтому порядок аргументов любой.
+
+
+def take_flag(args, name, default=""):
+    """Достать значение флага ``--name ЗНАЧЕНИЕ``, вырезав пару из списка."""
+    if name not in args:
+        return default
+    at = args.index(name)
+    if at + 1 >= len(args):
+        raise SystemExit("после {} нужно значение".format(name))
+    value = args[at + 1]
+    del args[at:at + 2]
+    return value
+
+
+def has_flag(args, name):
+    """Есть ли флаг без значения. Вырезает его из списка."""
+    if name not in args:
+        return False
+    args.remove(name)
+    return True
+
+
+# ─── откуда и куда ────────────────────────────────────────────────────────
+# Считаем до подключения к дрону: опечатка в номере метки выясняется на земле,
+# а не в воздухе.
+argv = sys.argv[1:]
+check_only = has_flag(argv, "--check")
+station_ip = take_flag(argv, "--station")
+
+# Опечатка в имени флага не должна молча уехать в позиционные и обвалить int().
+for item in argv:
+    if item.startswith("--"):
+        raise SystemExit("не знаю аргумент {} (есть --station и --check)".format(item))
+
+target = int(argv[0]) if len(argv) > 0 else DEFAULT_MARKER
+start = int(argv[1]) if len(argv) > 1 else DEFAULT_START
+# Третий аргумент — своя карта поля. Нужен в Gazebo: там раскладка меток
+# другая, и брать её надо ИЗ ТОГО ЖЕ файла, что скормлен ноде aruco_map,
+# иначе дрон считает место по одной карте, а летит по другой.
+map_path = argv[2] if len(argv) > 2 else MAP
+
+field = read_field_map(map_path)
+target_x, target_y = marker_xy(field, target)
+start_x, start_y = marker_xy(field, start)
+route_length = math.hypot(target_x - start_x, target_y - start_y)
+
+print("─" * 58)
+print("карта  {}".format(map_path))
+print("старт  метка {:>2} -> ({:.1f}, {:.1f})   (и точка возврата)".format(
+    start, start_x, start_y))
+print("цель   метка {:>2} -> ({:.1f}, {:.1f})".format(target, target_x, target_y))
+print("путь   {:.2f} м в одну сторону, ~{:.0f} с на {:.1f} м/с".format(
+    route_length, route_length / SPEED, SPEED))
+print("высота {:.1f} м, взлёт ~{:.0f} с на {:.1f} м/с".format(
+    ALT, ALT / CLIMB_SPEED, CLIMB_SPEED))
+print("зарядка {:.0f} с, из них последние {:.0f} с — зелёная лента".format(
+    CHARGE, CHARGE_GREEN))
+print("─" * 58)
+
+# ─── связь со станцией (ещё на земле) ─────────────────────────────────────
+# Проверяем до взлёта: неотвечающая станция — не повод не лететь (её могут
+# поднять позже), но знать об этом лучше стоя на земле, чем вися над кубом.
+station_open(station_ip)
+station_hello()
+
+if check_only:
+    # --check: проверить карту, сводку и связь, не включая моторы. Работает
+    # без ROS — единственная проверка скрипта, возможная не на дроне.
+    print("─" * 58)
+    print("ПРОВЕРКА ОКОНЧЕНА, моторы не включались")
+    sys.exit(0)
+
+# ─── подключение к дрону ──────────────────────────────────────────────────
+# ROS появляется только здесь: всё выше работает на любой машине с python3.
+import rospy                          # noqa: E402
+from technic import srv               # noqa: E402
+from std_srvs.srv import Trigger      # noqa: E402
+
+rospy.init_node("uav1_flight")
+
+navigate = rospy.ServiceProxy("navigate", srv.Navigate)
+get_telemetry = rospy.ServiceProxy("get_telemetry", srv.GetTelemetry)
+land = rospy.ServiceProxy("land", Trigger)
+set_effect = rospy.ServiceProxy("led/set_effect", srv.SetLEDEffect)
+
+
+def led(effect, color, what):
+    """Лента: ``effect`` — fill/blink/fade/flash/rainbow, ``color`` — (r, g, b).
+
+    Отказ ленты полёт не прерывает: балл за индикацию потеряется, но дрон
+    висит в воздухе и его надо посадить.
+    """
+    print("  лента: {}".format(what))
+    try:
+        set_effect(effect=effect, r=color[0], g=color[1], b=color[2])
+    except Exception as error:
+        print("  лента не отозвалась:", error)
+
+
+def navigate_wait(x=0.0, y=0.0, z=0.0, speed=SPEED, frame_id="body", auto_arm=False):
+    """Лететь в точку и ждать, пока долетим (пример из документации Skyris).
+
+    Ждём по фрейму ``navigate_target`` — это «сколько осталось до цели»:
+    сервис ``navigate`` возвращается сразу, дрон летит уже сам.
+    """
+    navigate(x=x, y=y, z=z, yaw=0.0, speed=speed, frame_id=frame_id, auto_arm=auto_arm)
+
+    deadline = time.time() + TIMEOUT
+    while not rospy.is_shutdown() and time.time() < deadline:
+        left = get_telemetry(frame_id="navigate_target")
+        if math.sqrt(left.x ** 2 + left.y ** 2 + left.z ** 2) < TOLERANCE:
+            return
+        rospy.sleep(0.2)
+
+
+def report(what, mark, mark_x, mark_y):
+    """Напечатать, где дрон сейчас и насколько это далеко от метки ``mark``.
+
+    Ничего не проверяет и полёт не прерывает — только показывает цифру, по
+    которой потом видно, куда дрон уехал и на каком этапе.
+    """
+    telemetry = get_telemetry(frame_id="aruco_map")
+    if math.isnan(telemetry.x) or math.isnan(telemetry.y):
+        print("{}: карты меток не видно, места не знаем".format(what))
+        return
+    away = math.hypot(telemetry.x - mark_x, telemetry.y - mark_y)
+    print("{}: ({:.2f}, {:.2f}, {:.2f}) | до метки {} — {:.2f} м".format(
+        what, telemetry.x, telemetry.y, telemetry.z, mark, away))
+
+
+def disarm():
+    """Выключить моторы явной командой (docs/TASK.md: 1 балл за автономность).
+
+    Прошивка экспериментальная, состав сервисов не гарантирован, поэтому
+    ``mavros_msgs`` импортируется здесь, а не наверху: отсутствие пакета не
+    должно ронять весь полёт ради одного балла. Любой отказ — повторный
+    ``land()``: дрон уже на земле, и это безопасно.
+    """
+    try:
+        from mavros_msgs.srv import CommandBool
+
+        rospy.wait_for_service("mavros/cmd/arming", timeout=3.0)
+        rospy.ServiceProxy("mavros/cmd/arming", CommandBool)(False)
+        print("МОТОРЫ ВЫКЛЮЧЕНЫ")
+    except Exception as error:
+        print("дизарм не вышел ({}) — глушим через land()".format(error))
+        land()
+        rospy.sleep(LANDING)
+
+
+# ─── 1. взлёт ─────────────────────────────────────────────────────────────
+print("ВЗЛЁТ на {:.1f} м".format(ALT))
+led("blink", YELLOW, "жёлтая мигающая — взлёт")
+navigate_wait(z=ALT, speed=CLIMB_SPEED, frame_id="body", auto_arm=True)
+rospy.sleep(3.0)  # повисеть, дать нодам увидеть карту меток
+report("НАЧАЛО", start, start_x, start_y)
+
+# ─── 2. полёт к зарядной станции ──────────────────────────────────────────
+print("ЛЕТИМ к метке {} (зарядная станция)".format(target))
+led("fill", RED, "красная — ищем зарядную станцию")
+navigate_wait(x=target_x, y=target_y, z=ALT, frame_id="aruco_map")
+rospy.sleep(3.0)
+report("НАД СТАНЦИЕЙ", target, target_x, target_y)
+
+# ─── 3. разрешение на посадку от станции ──────────────────────────────────
+# Регламент (docs/TASK.md, шаг 3): дрон садится на станцию ПО КОМАНДЕ ОТ НЕЁ.
+# Лента остаётся красной — по ней станция нас и опознаёт.
+print("ПРОСИМ У СТАНЦИИ разрешения на посадку")
+if ask_landing():
+    print("СТАНЦИЯ РАЗРЕШИЛА посадку")
+elif sock is None:
+    print("связи со станцией нет — садимся сами")
+else:
+    # Висеть над кубом до бесконечности хуже, чем сесть без разрешения:
+    # заряд тратится, а попытка ограничена по времени.
+    print("разрешения не дождались за {:.0f} с — садимся без него".format(WAIT_STATION))
+
+# ─── 4. посадка на станцию и зарядка ──────────────────────────────────────
+print("ПОСАДКА на станцию")
+land()
+rospy.sleep(LANDING)
+station_send("landed")   # станция: борт сел, моторы выключены
+
+print("ЗАРЯДКА {:.0f} с".format(CHARGE))
+led("blink", RED, "красная мигающая — идёт зарядка")
+rospy.sleep(CHARGE - CHARGE_GREEN)
+led("fill", GREEN, "зелёная — {:.0f} с до взлёта".format(CHARGE_GREEN))
+rospy.sleep(CHARGE_GREEN)
+
+# ─── 5. команда оператора на возврат ──────────────────────────────────────
+# Регламент (docs/TASK.md, шаг 5): возврат идёт после зарядки И команды с
+# клавиатуры. Дрон стоит на станции с выключенными моторами, ждать безопасно.
+if not wait_enter():
+    print("команды не было — возвращаемся сами")
+
+# ─── 6. возврат на старт и посадка ────────────────────────────────────────
+print("ЗАРЯДКА ОКОНЧЕНА, летим домой")
+print("ВЗЛЁТ со станции")
+led("blink", GREEN, "зелёная мигающая — возвращаемся")
+navigate_wait(z=ALT, speed=CLIMB_SPEED, frame_id="body", auto_arm=True)
+rospy.sleep(3.0)
+station_send("departed")   # станция: борт улетел, площадка свободна
+
+print("ВОЗВРАТ к метке {}".format(start))
+navigate_wait(x=start_x, y=start_y, z=ALT, frame_id="aruco_map")
+rospy.sleep(3.0)
+report("ДОМА", start, start_x, start_y)
+
+print("ПОСАДКА")
+land()
+rospy.sleep(LANDING)
+
+# ─── 7. автономное выключение моторов ─────────────────────────────────────
+disarm()
+
+led("fill", OFF, "гасим — миссия окончена")
+print("ГОТОВО")
